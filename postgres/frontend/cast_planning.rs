@@ -17,9 +17,6 @@ pub(crate) fn apply_cast(
     target: &TypeRef,
     context: CastContext,
 ) -> Result<CastDecision> {
-    if context != CastContext::Explicit {
-        return Ok(CastDecision::EngineRules);
-    }
     let Some(cast) = table_cast(source, target, context)? else {
         return Ok(CastDecision::EngineRules);
     };
@@ -46,7 +43,11 @@ fn table_cast(
     target: &TypeRef,
     context: CastContext,
 ) -> Result<Option<TableCast>> {
-    let CastRule::Table(target) = cast_rule(target, NamePlace::CastTarget)? else {
+    let target_place = match context {
+        CastContext::Assignment => NamePlace::Column,
+        _ => NamePlace::CastTarget,
+    };
+    let CastRule::Table(target) = cast_rule(target, target_place)? else {
         return Ok(None);
     };
     let (source, context) = match source() {
@@ -186,6 +187,8 @@ fn registered_cast_type(name: &str) -> Option<CastType> {
 /// types a name stands for depends on the place.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NamePlace {
+    /// The type of a column, as the schema keeps it.
+    Column,
     /// The type a CAST names.
     CastTarget,
     /// The type core gives an expression.
@@ -196,20 +199,22 @@ enum NamePlace {
 /// The type of `CASTS` that the lowercase name `name` of a type that is not
 /// registered stands for.
 fn named_cast_type(name: &str, place: NamePlace) -> Option<CastType> {
-    use NamePlace::{CastTarget, Value};
+    use NamePlace::{CastTarget, Column, Value};
     Some(match (name, place) {
         ("int4", _) => Int4,
+        // FIXME(pg-catalog): An int4 column is INTEGER in the schema, and so is a bigserial column, so a write to it is only checked for the range of int8. A registered int4 type gives the column its own range check.
+        ("integer", Column) => Int8,
         // FIXME(pg-catalog): Core types every integer expression INTEGER, also `int8col + 1` and the literal 3000000000, which PostgreSQL types int8. So `3000000000::int4` is a cast from int4 and its range is not checked. Registered int4 and int8 types, and operator result types from pg_operator, give the expression its real type.
         ("integer", Value) => Int4,
         ("float4", _) => Float4,
         ("float8", _) => Float8,
-        // FIXME(pg-catalog): Core types every float expression REAL, so a float4 expression is typed float8. A registered float4 type gives it its own type.
-        ("real", Value) => Float8,
+        // FIXME(pg-catalog): A float4 column is REAL in the schema, so it is only checked for the range of float8, and a float4 expression is typed float8. A registered float4 type fixes both.
+        ("real", Column | Value) => Float8,
         // A decimal literal, which core types NUMERIC.
         ("numeric", Value) => Numeric,
         // FIXME(pg-catalog): The translator lowers a CAST to varchar, char, name, json, jsonb, inet, cidr, macaddr and xml to a CAST to TEXT, so all of them are cast as text here. Registered types that keep their name in the CAST replace this.
         ("text", _) => Text,
-        (_, CastTarget | Value) => return None,
+        (_, Column | CastTarget | Value) => return None,
     })
 }
 
