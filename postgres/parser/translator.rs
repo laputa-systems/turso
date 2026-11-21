@@ -3209,8 +3209,10 @@ impl PostgreSQLTranslator {
                 ));
                 let root = Box::new(ast::Expr::Literal(ast::Literal::String("'$'".into())));
                 let extract = |operator| ast::Expr::Binary(field.clone(), operator, root.clone());
-                let reads_json_text =
-                    is_json || cast_type.as_ref().is_some_and(|t| t.name == "TEXT");
+                let reads_json_text = is_json
+                    || cast_type
+                        .as_ref()
+                        .is_some_and(|t| t.name.eq_ignore_ascii_case("text"));
                 let value = if reads_json_text {
                     let mut when_then_pairs = vec![(
                         Box::new(ast::Expr::Literal(ast::Literal::String("'null'".into()))),
@@ -3228,7 +3230,16 @@ impl PostgreSQLTranslator {
                         else_expr: Some(Box::new(extract(ast::Operator::ArrowRight))),
                     }
                 } else {
-                    extract(ast::Operator::ArrowRightShift)
+                    // The column type reads the field from its text, as in
+                    // PostgreSQL: 1.5 is not an integer.
+                    ast::Expr::Cast {
+                        expr: Box::new(extract(ast::Operator::ArrowRightShift)),
+                        type_name: Some(ast::Type {
+                            name: "text".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }
                 };
                 let cast = ast::Expr::Cast {
                     expr: Box::new(value),
@@ -7898,35 +7909,52 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
     Some(format!("{sign}{digits}"))
 }
 
-/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (smallint and oid to INTEGER; numeric and money to REAL; json, inet and uuid to TEXT), so the PostgreSQL type is gone before the cast is checked. A pg_type lookup and a typed expression tree that keeps the type replace this.
+/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (oid and the serial types to INTEGER; numeric and money to REAL; varchar, json and inet to TEXT; every array element type), so the PostgreSQL type is gone before the cast is checked. int2, int4, int8, float4, float8, text and uuid keep their PostgreSQL name, which the cast table of the frontend reads. Once every type is registered, each cast keeps the name of its type and this map goes away.
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types. A type that the frontend
-/// registers, such as boolean, keeps its name, and so do other names, so that
-/// enums and domains resolve to their custom type.
+/// A type that the frontend registers, such as boolean, keeps its name, and
+/// so do other names, so that enums and domains resolve to their custom type.
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {
     let pg_type = supported_type_name(type_name)?;
+    let is_array = !type_name.array_bounds.is_empty();
 
-    let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
-        | "REGCLASS" | "REGTYPE" => "INTEGER",
+    let name = match (pg_type.to_uppercase().as_str(), is_array) {
+        // The dialect applies the casts to these types, and tells them apart
+        // by their PostgreSQL names. An array keeps the SQLite name of its
+        // element type, which is the name core's arrays know.
+        ("INTEGER" | "INT" | "INT4", false) => "int4",
+        ("SMALLINT" | "INT2", false) => "int2",
+        ("BIGINT" | "INT8", false) => "int8",
+        ("REAL" | "FLOAT4", false) => "float4",
+        ("DOUBLE PRECISION" | "FLOAT8", false) => "float8",
+        ("TEXT", false) => "text",
+        ("UUID", false) => "uuid",
+        (
+            "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
+            | "REGCLASS" | "REGTYPE",
+            _,
+        ) => "INTEGER",
         // Casts like INTEGER; the name types the result as int8.
-        "BIGINT" | "INT8" | "BIGSERIAL" => "BIGINT",
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
-            "REAL"
-        }
+        ("BIGINT" | "INT8" | "BIGSERIAL", _) => "BIGINT",
+        (
+            "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY",
+            _,
+        ) => "REAL",
         // The frontend registers these types, so the cast names the type
         // and converts the value as a column of the type does.
-        "BOOLEAN" | "BOOL" => "boolean",
-        "DATE" => "date",
-        "TIME" => "time",
-        "TIMESTAMP" => "timestamp",
-        "TIMESTAMPTZ" => "timestamptz",
+        ("BOOLEAN" | "BOOL", _) => "boolean",
+        ("DATE", _) => "date",
+        ("TIME", _) => "time",
+        ("TIMESTAMP", _) => "timestamp",
+        ("TIMESTAMPTZ", _) => "timestamptz",
         // For CAST expressions, map all text-like PG types to TEXT.
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"
-        | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
-        "BYTEA" | "BLOB" => "BLOB",
+        (
+            "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INET" | "JSON" | "JSONB"
+            | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY",
+            _,
+        ) => "TEXT",
+        ("BYTEA" | "BLOB", _) => "BLOB",
         _ => &pg_type,
     };
 
@@ -10875,7 +10903,7 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
 }
 
 /// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
-const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range"];
+const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range", "pg_cast"];
 
 // FIXME(pg-collation): This hand-codes the pg_collation entries that compare bytes (C, POSIX, ucs_basic) and counts default among them, where PostgreSQL's default collation is the one of the database (pg_database.datcollate, en_US.utf8 in the postgres:18 image). It matches the names without regard to case, so it accepts `COLLATE C`, which PostgreSQL folds to "c" and refuses. A lookup in a pg_collation table replaces this.
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {

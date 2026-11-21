@@ -3204,3 +3204,18 @@ test date-trunc-century-millennium-low-years {
 expect {
     0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0010-01-01 00:00:00+00
 }
+
+# A column of the column definition list is read as its type, by the cast
+# from text to that type.
+test json-to-record-reads-a-column-as-its-type {
+    SELECT a + 1, b || 'y', e + 1 FROM json_to_record('{"a":1,"b":"x","e":7}') AS x(a int, b text, e bigint);
+}
+expect {
+    2|xy|8
+}
+
+test json-to-record-fraction-in-an-integer-column-fails {
+    SELECT a FROM json_to_record('{"a":1.5}') AS x(a int);
+}
+@sqlstate 22P02
+expect error {}

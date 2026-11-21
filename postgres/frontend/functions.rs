@@ -391,6 +391,7 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
             "bigint out of range", None,
         ))?,
+        "pg_cast"(FunctionArity::Exact(3), true) => crate::cast_planning::exec_pg_cast(args)?,
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
@@ -1830,7 +1831,7 @@ fn write_json_string(text: &str, json: &mut String) {
 /// A float8 in PostgreSQL's text form: the shortest digits that read back as
 /// the same number, in scientific notation when the exponent is below -4 or
 /// 15 or more, as in `1e+20` and `1e-05`.
-fn float8_text(value: f64) -> String {
+pub(crate) fn float8_text(value: f64) -> String {
     if value.is_infinite() {
         return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
