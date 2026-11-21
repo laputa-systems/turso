@@ -826,6 +826,15 @@ pub fn emit_upsert(
     }
 
     if let Some(bt) = table.btree() {
+        let sources = match bt.is_strict {
+            true => crate::translate::emitter::update::set_value_sources(
+                bt.columns().len(),
+                table_references,
+                set_pairs.iter().map(|(col_idx, expr)| (*col_idx, &**expr)),
+                resolver,
+            ),
+            false => Vec::new(),
+        };
         emit_input_conversion(
             program,
             resolver,
@@ -833,6 +842,7 @@ pub fn emit_upsert(
             new_start,
             &layout,
             StatementValues::of_insert(program),
+            &sources,
         )?;
     }
 

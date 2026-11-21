@@ -185,6 +185,8 @@ pub struct InsertEmitCtx<'a> {
     /// when a DO UPDATE must fail on such a row (see
     /// [crate::Dialect::upsert_rejects_row_written_by_same_statement]).
     pub written_rowids_cursor_id: Option<usize>,
+    /// The source type of each value of a row, in the order of the values.
+    pub value_sources: Vec<crate::dialect::CastSource>,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -241,6 +243,7 @@ impl<'a> InsertEmitCtx<'a> {
             namespace,
             returning_buffer: None,
             written_rowids_cursor_id: None,
+            value_sources: Vec::new(),
         })
     }
 }
@@ -774,6 +777,10 @@ pub fn translate_insert(
             !column.is_generated() && !has_custom_type(column)
         })?;
     }
+    let value_sources = match ctx.table.is_strict {
+        true => insert_value_sources(&insertion, &ctx.value_sources, resolver),
+        false => Vec::new(),
+    };
     emit_input_conversion(
         program,
         resolver,
@@ -781,6 +788,7 @@ pub fn translate_insert(
         insertion.first_col_register(),
         &ctx.table.column_layout()?,
         StatementValues::of_insert(program),
+        &value_sources,
     )?;
     if let Some(type_check_table) = &maybe_type_check_table {
         if !program.flags.writes_stored_values() {
@@ -1250,6 +1258,7 @@ fn emit_new_row_for_before_triggers(
         new_first_col_reg,
         &table.column_layout()?,
         StatementValues::of_insert(program),
+        &[],
     )?;
 
     let new_registers: Vec<usize> = insertion
@@ -2557,15 +2566,24 @@ fn init_source_emission<'a>(
                     yield_reg,
                     coroutine_implementation_start: ctx.halt_label,
                 };
-                let num_result_cols = program.nested(|program| {
+                let value_columns =
+                    match ctx.table.is_strict && !program.flags.writes_stored_values() {
+                        true => (0..required_column_count)
+                            .map(|position| insert_target_column(table, columns, position))
+                            .collect(),
+                        false => Vec::new(),
+                    };
+                let (num_result_cols, value_sources) = program.nested(|program| {
                     translate_insert_source_select(
                         select,
                         resolver,
                         program,
                         query_destination,
                         connection,
+                        &value_columns,
                     )
                 })?;
+                ctx.value_sources = value_sources;
                 if num_result_cols != required_column_count {
                     crate::bail_parse_error!(
                         "table {} has {required_column_count} columns but {} values were supplied",
@@ -2705,6 +2723,15 @@ fn init_source_emission<'a>(
     };
     ctx.num_values = num_values;
     ctx.cursor_id = cursor_id;
+    if ctx.yield_reg_opt.is_none() {
+        let env = crate::translate::expr::expr_type::TypeEnv::new(None, resolver);
+        ctx.value_sources = values
+            .iter()
+            .map(|value| {
+                crate::translate::expr::expr_type::cast_source_of(value, &env, resolver.schema())
+            })
+            .collect();
+    }
     Ok(())
 }
 
@@ -4536,6 +4563,33 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         program.preassign_label_to_next_insn(skip_fk);
     }
     Ok(())
+}
+
+/// The source of the value of each column of the table in a row that an
+/// INSERT writes. `value_sources` has the sources in the order of the values.
+fn insert_value_sources(
+    insertion: &Insertion,
+    value_sources: &[crate::dialect::CastSource],
+    resolver: &Resolver,
+) -> Vec<crate::dialect::CastSource> {
+    insertion
+        .col_mappings
+        .iter()
+        .map(|mapping| match mapping.value_index {
+            Some(index) => value_sources
+                .get(index)
+                .cloned()
+                .unwrap_or(crate::dialect::CastSource::Unnamed),
+            None => {
+                let default = column_default_expr(mapping.column, true, resolver);
+                crate::translate::expr::expr_type::cast_source_of(
+                    &default,
+                    &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+                    resolver.schema(),
+                )
+            }
+        })
+        .collect()
 }
 
 /// Emit encode expressions for columns with custom types.
