@@ -305,6 +305,7 @@ pub(super) fn choose_best_btree_candidate(
                     IterationDirection::Forwards,
                     candidate.index.as_deref(),
                     &usable_constraint_refs,
+                    &rhs_constraints.constraints,
                     order_target,
                     0,
                     schema,
@@ -316,6 +317,7 @@ pub(super) fn choose_best_btree_candidate(
                     IterationDirection::Backwards,
                     candidate.index.as_deref(),
                     &usable_constraint_refs,
+                    &rhs_constraints.constraints,
                     order_target,
                     0,
                     schema,
@@ -2060,6 +2062,7 @@ fn find_best_access_method_for_subquery(
             rhs_table,
             &ephemeral_index,
             &usable_constraint_refs,
+            &rhs_constraints.constraints,
             maybe_order_target,
             schema,
             base_row_count,
@@ -2237,10 +2240,12 @@ fn materialized_subquery_ephemeral_index(
 ///
 /// The returned bonus is the estimated sorter work avoided by getting rows in
 /// the right order directly from the temporary index.
+#[allow(clippy::too_many_arguments)]
 fn materialized_subquery_order_properties(
     rhs_table: &JoinedTable,
     index: &Arc<Index>,
     constraint_refs: &[RangeConstraintRef],
+    constraints: &[Constraint],
     maybe_order_target: Option<&OrderTarget>,
     schema: &Schema,
     base_row_count: RowCountEstimate,
@@ -2257,6 +2262,7 @@ fn materialized_subquery_order_properties(
         IterationDirection::Forwards,
         Some(index.as_ref()),
         constraint_refs,
+        constraints,
         order_target,
         0,
         schema,
@@ -2268,6 +2274,7 @@ fn materialized_subquery_order_properties(
         IterationDirection::Backwards,
         Some(index.as_ref()),
         constraint_refs,
+        constraints,
         order_target,
         0,
         schema,
