@@ -276,7 +276,9 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
                 Some(_) => int4_arg(args, 1)?,
                 None => None,
             };
-            oid_arg(args, 0)?.map(|type_oid| format_type(connection, type_oid, typemod))
+            oid_arg(args, 0)?
+                .map(|type_oid| format_type(connection, type_oid, typemod))
+                .transpose()?
         },
         "pg_get_constraintdef"(FunctionArity::OneOf(&[1, 2]), false) => oid_arg(args, 0)?
             .and_then(|oid| crate::catalog::pg_get_constraintdef(connection, oid)),
@@ -1627,32 +1629,32 @@ fn exec_pg_encoding_to_char(encoding: i64) -> &'static str {
 
 /// The name of type `type_oid` as `format_type` prints it, with the type
 /// modifier `typemod` when the call gives one.
-fn format_type(conn: &Connection, type_oid: i64, typemod: Option<i64>) -> String {
+fn format_type(conn: &Connection, type_oid: i64, typemod: Option<i64>) -> Result<String> {
     if type_oid == 0 {
-        return "-".to_string();
+        return Ok("-".to_string());
     }
     let Some((name, element_oid)) = crate::catalog::pg_type_by_oid(conn, type_oid) else {
-        return "???".to_string();
+        return Ok("???".to_string());
     };
     let Some(element_oid) = element_oid else {
         return format_type_name(type_oid, &name, typemod);
     };
     let (element_name, _) = crate::catalog::pg_type_by_oid(conn, element_oid)
-        .expect("the element types of PG_ARRAY_TYPES are in PG_BASE_TYPES");
-    format!(
+        .expect("the element type of an array type is in pg_type");
+    Ok(format!(
         "{}[]",
-        format_type_name(element_oid, &element_name, typemod)
-    )
+        format_type_name(element_oid, &element_name, typemod)?
+    ))
 }
 
 /// The name of type `type_oid` named `name`, which is not an array type, as
 /// `format_type` prints it. `typemod` is None when the call gives no modifier or NULL, and a
 /// negative modifier means none too.
-fn format_type_name(type_oid: i64, name: &str, typemod: Option<i64>) -> String {
+fn format_type_name(type_oid: i64, name: &str, typemod: Option<i64>) -> Result<String> {
     let modifier = typemod.filter(|&typemod| typemod >= 0);
     // The types matched by oid print the SQL standard names that PostgreSQL's
     // format_type_extended prints. Every other type prints its pg_type name.
-    match (type_oid, modifier) {
+    Ok(match (type_oid, modifier) {
         (16, _) => "boolean".to_string(),
         (20, _) => "bigint".to_string(),
         (21, _) => "smallint".to_string(),
@@ -1672,7 +1674,8 @@ fn format_type_name(type_oid: i64, name: &str, typemod: Option<i64>) -> String {
         (1114, None) => "timestamp without time zone".to_string(),
         (1184, Some(typemod)) => format!("timestamp({typemod}) with time zone"),
         (1184, None) => "timestamp with time zone".to_string(),
-        (1186, _) => "interval".to_string(),
+        (1186, Some(typemod)) => format!("interval{}", interval_typmod(typemod)?),
+        (1186, None) => "interval".to_string(),
         (1700, Some(typemod)) if typemod >= 4 => {
             let precision = ((typemod - 4) >> 16) & 0xffff;
             let scale = (((typemod - 4) & 0x7ff) ^ 1024) - 1024;
@@ -1681,6 +1684,47 @@ fn format_type_name(type_oid: i64, name: &str, typemod: Option<i64>) -> String {
         (1700, _) => "numeric".to_string(),
         (_, Some(typemod)) => format!("{}({typemod})", turso_pg_parser::quote_identifier(name)),
         (_, None) => turso_pg_parser::quote_identifier(name),
+    })
+}
+
+/// The modifier of `interval`, as PostgreSQL's intervaltypmodout prints it:
+/// the fields in the high 16 bits of `typemod`, as bits numbered by
+/// datetime.h, and the precision of the seconds in the low 16 bits.
+fn interval_typmod(typemod: i64) -> Result<String> {
+    const MONTH: i64 = 1 << 1;
+    const YEAR: i64 = 1 << 2;
+    const DAY: i64 = 1 << 3;
+    const HOUR: i64 = 1 << 10;
+    const MINUTE: i64 = 1 << 11;
+    const SECOND: i64 = 1 << 12;
+    let fields = match (typemod >> 16) & 0x7fff {
+        YEAR => " year",
+        MONTH => " month",
+        DAY => " day",
+        HOUR => " hour",
+        MINUTE => " minute",
+        SECOND => " second",
+        f if f == YEAR | MONTH => " year to month",
+        f if f == DAY | HOUR => " day to hour",
+        f if f == DAY | HOUR | MINUTE => " day to minute",
+        f if f == DAY | HOUR | MINUTE | SECOND => " day to second",
+        f if f == HOUR | MINUTE => " hour to minute",
+        f if f == HOUR | MINUTE | SECOND => " hour to second",
+        f if f == MINUTE | SECOND => " minute to second",
+        0x7fff => "",
+        _ => {
+            return Err(sqlstate_error(
+                SQLSTATE_INTERNAL_ERROR,
+                format!("invalid INTERVAL typmod: {typemod:#x}"),
+                None,
+            ))
+        }
+    };
+    let precision = typemod & 0xffff;
+    if precision == 0xffff {
+        Ok(fields.to_string())
+    } else {
+        Ok(format!("{fields}({precision})"))
     }
 }
 
@@ -1979,8 +2023,10 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
 }
 
 /// Parses `input` as a value of the PostgreSQL integer type `type_name`, whose
-/// values run from `min` to `max`. An error is the message and the SQLSTATE
-/// PostgreSQL gives.
+/// values run from `min` to `max`, with the rules of PostgreSQL's
+/// pg_strtoint64_safe: white space around the number, a sign, a `0x`, `0o` or
+/// `0b` prefix, and single underscores between digits. An error is the
+/// message and the SQLSTATE PostgreSQL gives.
 fn parse_pg_integer(
     input: &str,
     type_name: &str,
@@ -1993,22 +2039,54 @@ fn parse_pg_integer(
             SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
         )
     };
-    match input.trim().parse::<i64>() {
-        Ok(value) if (min..=max).contains(&value) => Ok(value),
-        Ok(_) => Err(out_of_range()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow
-            ) =>
-        {
-            Err(out_of_range())
-        }
-        Err(_) => Err((
+    let invalid = || {
+        (
             format!("invalid input syntax for type {type_name}: \"{input}\""),
             SQLSTATE_INVALID_TEXT_REPRESENTATION,
-        )),
+        )
+    };
+    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
+    let number = input.trim_matches(is_space);
+    let (negative, unsigned) = match number.as_bytes().first() {
+        Some(b'-') => (true, &number[1..]),
+        Some(b'+') => (false, &number[1..]),
+        _ => (false, number),
+    };
+    let prefix = unsigned.get(..2).map(str::to_ascii_lowercase);
+    let (radix, digits) = match prefix.as_deref() {
+        Some("0x") => (16, &unsigned[2..]),
+        Some("0o") => (8, &unsigned[2..]),
+        Some("0b") => (2, &unsigned[2..]),
+        _ => (10, unsigned),
+    };
+    // Only a number with a prefix can start with an underscore, as in `0x_ff`.
+    if digits.is_empty() || (radix == 10 && digits.starts_with('_')) {
+        return Err(invalid());
     }
+    let mut magnitude: u64 = 0;
+    let mut chars = digits.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '_' {
+            if !chars.peek().is_some_and(|next| next.is_digit(radix)) {
+                return Err(invalid());
+            }
+            continue;
+        }
+        let digit = c.to_digit(radix).ok_or_else(invalid)?;
+        magnitude = magnitude
+            .checked_mul(radix.into())
+            .and_then(|m| m.checked_add(digit.into()))
+            .ok_or_else(out_of_range)?;
+    }
+    let value = if negative {
+        -i128::from(magnitude)
+    } else {
+        i128::from(magnitude)
+    };
+    i64::try_from(value)
+        .ok()
+        .filter(|value| (min..=max).contains(value))
+        .ok_or_else(out_of_range)
 }
 
 /// The value of a PostgreSQL boolean literal such as 'yes', 'off' or 'tr',

@@ -395,6 +395,21 @@ expect {
     1
 }
 
+test pg-input-is-valid-integer-prefixes-and-underscores {
+    SELECT pg_input_is_valid('0x_ff', 'int4'), pg_input_is_valid('-0x8000_0000', 'int4'),
+           pg_input_is_valid('0O17', 'int2'), pg_input_is_valid('_1', 'int4'),
+           pg_input_is_valid('1_', 'int4'), pg_input_is_valid('1__0', 'int8'),
+           pg_input_is_valid('0x', 'int4'), pg_input_is_valid('0b2', 'int4'),
+           pg_input_is_valid('-0x8000000000000000', 'int8');
+    SELECT message, sql_error_code FROM pg_input_error_info('0x8000_0000', 'integer');
+    SELECT message, sql_error_code FROM pg_input_error_info('99999999999999999999_', 'bigint');
+}
+expect {
+    t|t|t|f|f|f|f|f|t
+    value "0x8000_0000" is out of range for type integer|22003
+    value "99999999999999999999_" is out of range for type bigint|22003
+}
+
 test current-setting-numeric-parameter-name-errors {
     SELECT current_setting(5.5);
 }
@@ -1195,6 +1210,30 @@ test format-type-typmods {
 }
 expect {
     character|bpchar|character(5)|timestamp(3) without time zone|timestamp(0) with time zone|time(2) without time zone|numeric(0,0)|numeric(9,-1)|text(5)|character varying(5)|character varying(5)
+}
+
+test format-type-interval-typmods {
+    SELECT format_type(1186, 2147418115), format_type(1187, 196607), format_type(1186, 458751),
+           format_type(1186, 469827583), format_type(1186, -1), format_type(1186, 2147418112);
+}
+expect {
+    interval(3)|interval month[]|interval year to month|interval hour to second|interval|interval(0)
+}
+
+test format-type-invalid-interval-typmod {
+    SELECT format_type(1186, 5);
+}
+@sqlstate XX000
+expect error {
+    invalid INTERVAL typmod: 0x5
+}
+
+test format-type-text-typmod-with-prefix-and-underscores {
+    SELECT format_type(1043, '0x10'), format_type(1043, ' 1_6 '), format_type(1043, '0o20'),
+           format_type(1043, '+0B1_0000');
+}
+expect {
+    character varying(12)|character varying(12)|character varying(12)|character varying(12)
 }
 
 test format-type-text-typmod-not-an-integer {

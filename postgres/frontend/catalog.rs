@@ -2341,12 +2341,12 @@ pub(crate) fn pg_type_by_oid(conn: &Connection, oid: i64) -> Option<(String, Opt
         .to_text()
         .expect("pg_type names are text")
         .to_string();
-    // PostgreSQL's IsTrueArrayType: only the rows of PG_ARRAY_TYPES. `name`
-    // has an element type too, but is not an array type.
-    let element_oid = PG_ARRAY_TYPES
-        .iter()
-        .find(|&&(array_oid, _, _)| array_oid == oid)
-        .map(|&(_, _, typelem)| typelem);
+    let typlen = row[4].as_int().expect("pg_type.typlen is an integer");
+    let typelem = row[13].as_int().expect("pg_type.typelem is an integer");
+    // PostgreSQL's IsTrueArrayType: a type with an element type is an array
+    // type only when it has variable length. `name` has the element type
+    // `char` and a fixed length, and is not an array type.
+    let element_oid = (typelem != 0 && typlen == -1).then_some(typelem);
     Some((name, element_oid))
 }
 
