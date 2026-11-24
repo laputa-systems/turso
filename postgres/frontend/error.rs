@@ -101,6 +101,18 @@ pub fn wrong_relation_kind(name: &str, expected_kind: &str, kind: &str) -> Limbo
     }))
 }
 
+/// The error of a CREATE that gives a type, or the row type of a relation,
+/// the name of a type of the same schema, with the HINT `hint` if there is
+/// one.
+pub fn type_already_exists(name: &str, hint: Option<&str>) -> LimboError {
+    LimboError::Dialect(Box::new(DialectError {
+        code: SQLSTATE_DUPLICATE_OBJECT,
+        message: format!("type \"{name}\" already exists"),
+        detail: None,
+        hint: hint.map(Into::into),
+    }))
+}
+
 pub fn sql_parse_error(error: turso_pg_parser::ParseError) -> LimboError {
     match error {
         turso_pg_parser::ParseError::Sqlstate { sqlstate, message } => {
@@ -349,8 +361,8 @@ pub(crate) fn sqlstate(error: &LimboError) -> &'static str {
 /// come first, because their messages end with the error that the dependent
 /// object gives, for example "no such column". A duplicate object is checked
 /// before the "no such ..." rules, because its name sits inside the message, for
-/// example a table named "no such table". A role is not a relation, so a
-/// duplicate role has its own SQLSTATE.
+/// example a table named "no such table". A role or a type is not a
+/// relation, so a duplicate role or type has its own SQLSTATE.
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
@@ -368,7 +380,9 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_PARAMETER_VALUE
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
-    } else if msg.starts_with("role \"") && msg.ends_with("\" already exists") {
+    } else if (msg.starts_with("role \"") || msg.starts_with("type "))
+        && msg.ends_with(" already exists")
+    {
         SQLSTATE_DUPLICATE_OBJECT
     } else if msg.contains("no such table")
         || msg.starts_with("no such view")
@@ -451,14 +465,13 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
 /// start and can end with ` already exists` when the column name does, so it
 /// is excluded.
 fn is_duplicate_object_error(msg: &str) -> bool {
-    const KINDS: [&str; 8] = [
+    const KINDS: [&str; 7] = [
         "table ",
         "view ",
         "View ",
         "index ",
         "trigger ",
         "schema ",
-        "type ",
         "sequence ",
     ];
     msg.ends_with(" already exists")
@@ -663,6 +676,8 @@ mod tests {
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
             ("relation \"t\" already exists", SQLSTATE_DUPLICATE_TABLE),
             ("role \"r\" already exists", SQLSTATE_DUPLICATE_OBJECT),
+            ("type t already exists", SQLSTATE_DUPLICATE_OBJECT),
+            ("type no such table already exists", SQLSTATE_DUPLICATE_OBJECT),
             (
                 "role \"no such table\" already exists",
                 SQLSTATE_DUPLICATE_OBJECT,

@@ -296,6 +296,87 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    /// PostgreSQL looks for a type of the relation's name before it makes
+    /// the relation's row type. It does so for a sequence too, which gets
+    /// no row type, but not for an index. Only CREATE gives the HINT; the
+    /// rename of the row type gives none.
+    fn check_relation_name_against_types(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceRef,
+        kind: RelationKind,
+        name: &str,
+        renaming: bool,
+    ) -> Result<()> {
+        let checks_types = match kind {
+            RelationKind::Table
+            | RelationKind::View
+            | RelationKind::MaterializedView
+            | RelationKind::Sequence => true,
+            RelationKind::Index => false,
+        };
+        if !checks_types || !holds_user_types(schema, namespace) {
+            return Ok(());
+        }
+        let Some(type_def) = schema
+            .get_type_def_unchecked(name)
+            .filter(|type_def| !type_def.is_builtin)
+        else {
+            return Ok(());
+        };
+        if type_def.name != name {
+            return Err(names_differ_only_in_case(&type_def.name, name));
+        }
+        let hint = (!renaming).then_some(
+            "A relation has an associated type of the same name, so you must use a name that \
+             doesn't conflict with any existing type.",
+        );
+        Err(crate::error::type_already_exists(name, hint))
+    }
+
+    /// Tables, views and materialized views have a row type of their name.
+    /// Sequences and indexes have none.
+    fn check_type_name_against_relations(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceRef,
+        name: &str,
+    ) -> Result<()> {
+        if !holds_user_types(schema, namespace) {
+            return Err(crate::error::sqlstate_error(
+                turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "creating a type in a schema other than public is not supported",
+                None,
+            ));
+        }
+        // A table keeps the letter case of its name in `declared_name`. The
+        // engine keeps the name of a view in lower case only.
+        let row_type_name = match schema.relation_kind(namespace.id, name) {
+            Some(RelationKind::Table | RelationKind::MaterializedView) => Some(
+                schema
+                    .get_btree_table(namespace.id, name)
+                    .expect("relation_kind found a B-tree table of this name")
+                    .declared_name
+                    .clone(),
+            ),
+            Some(RelationKind::View) => Some(
+                schema
+                    .get_view(namespace.id, name)
+                    .expect("relation_kind found a view of this name")
+                    .name
+                    .clone(),
+            ),
+            Some(RelationKind::Sequence | RelationKind::Index) | None => None,
+        };
+        match row_type_name {
+            Some(row_type_name) if row_type_name == name => {
+                Err(crate::error::type_already_exists(name, None))
+            }
+            Some(row_type_name) => Err(names_differ_only_in_case(&row_type_name, name)),
+            None => Ok(()),
+        }
+    }
+
     fn supports_capture_data_changes(&self) -> bool {
         false
     }
@@ -531,6 +612,35 @@ pub(crate) fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
         return PUBLIC_NAMESPACE_OID;
     }
     FIRST_USER_SCHEMA_OID + i64::from(namespace.as_u32())
+}
+
+/// FIXME(pg-namespace): This hand-codes that every user type is in schema
+/// public, because the engine keeps types in no schema and pg_type lists
+/// them all in public. A pg_namespace entry for each type, which CREATE
+/// TYPE takes from search_path, replaces this.
+/// Whether `namespace` is the schema of the user types.
+fn holds_user_types(schema: &Schema, namespace: NamespaceRef) -> bool {
+    namespace.database_id == MAIN_DB_ID
+        && namespace_oid(schema, namespace.id) == PUBLIC_NAMESPACE_OID
+}
+
+/// FIXME(pg-quoted-identifier): The engine folds the name of a type to
+/// lower case and finds types and relations by a name in any letter case, so
+/// a type and a relation whose names differ only in case would be found by
+/// each other's name. PostgreSQL keeps them apart. Names that keep their
+/// case in the engine replace this error.
+/// The error for a new type or relation named `new_name` when a relation or
+/// type of the schema is named `existing_name`, which differs from it only in
+/// letter case.
+fn names_differ_only_in_case(existing_name: &str, new_name: &str) -> LimboError {
+    crate::error::sqlstate_error(
+        turso_pg_parser::sqlstate::SQLSTATE_FEATURE_NOT_SUPPORTED,
+        format!(
+            "a type and a relation named \"{existing_name}\" and \"{new_name}\", which differ \
+             only in letter case, are not supported"
+        ),
+        None,
+    )
 }
 
 /// Whether `name` is a table that the engine or this frontend owns, rather

@@ -5009,6 +5009,7 @@ impl<'a> Parser<'a> {
                         };
                         return Ok(Stmt::CreateType {
                             if_not_exists,
+                            namespace: None,
                             type_name,
                             body,
                         });
@@ -5205,6 +5206,7 @@ impl<'a> Parser<'a> {
 
         Ok(Stmt::CreateType {
             if_not_exists,
+            namespace: None,
             type_name,
             body: CreateTypeBody::CustomType {
                 params,
@@ -5322,6 +5324,7 @@ impl<'a> Parser<'a> {
 
         Ok(Stmt::CreateDomain {
             if_not_exists,
+            namespace: None,
             domain_name,
             base_type,
             default,
