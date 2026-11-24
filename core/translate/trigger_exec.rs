@@ -168,27 +168,27 @@ struct TriggerSubprogramContext {
     db_name: Option<ast::Name>,
 }
 
-/// The parameter that stands for NEW.x or OLD.x. It carries the custom type
-/// and the collation of column x; None for the rowid.
+/// The parameter that stands for NEW.x or OLD.x. It carries the name x as
+/// written in the reference, and the custom type and the collation of column
+/// x; `column` is None for the rowid.
 fn variable_from_parameter_index(
     index: NonZero<usize>,
+    name: &str,
     column: Option<(&Column, Option<&ast::Type>)>,
 ) -> Expr {
     let nz = u32::try_from(index.get())
         .ok()
         .and_then(std::num::NonZeroU32::new)
         .expect("trigger parameter index must fit into NonZeroU32");
-    match column {
+    let mut variable = match column {
         Some((column, custom_type)) => {
             let collation = column_collation(column).map(|collation| collation.name());
-            Expr::Variable(ast::Variable::for_column(
-                nz,
-                custom_type.cloned(),
-                collation.as_deref(),
-            ))
+            ast::Variable::for_column(nz, custom_type.cloned(), collation.as_deref())
         }
-        None => Expr::Variable(ast::Variable::indexed(nz)),
-    }
+        None => ast::Variable::indexed(nz),
+    };
+    variable.column_name = Some(name.into());
+    Expr::Variable(variable)
 }
 
 impl TriggerSubprogramContext {
@@ -407,7 +407,8 @@ fn rewrite_trigger_expr_single_for_subprogram(
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
             let ns = normalize_ident(ns.as_str());
-            let col = normalize_ident(col.as_str());
+            let written_col = col.as_str().to_string();
+            let col = normalize_ident(&written_col);
 
             // Handle NEW.column references
             if ns.eq_ignore_ascii_case("new") {
@@ -419,6 +420,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             *e = variable_from_parameter_index(
                                 ctx.get_new_rowid_param()
                                     .expect("NEW parameters must be provided"),
+                                &written_col,
                                 Some((col_def, ty)),
                             );
                             return Ok(());
@@ -427,6 +429,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             *e = variable_from_parameter_index(
                                 ctx.get_new_param(idx)
                                     .expect("NEW parameters must be provided"),
+                                &written_col,
                                 Some((col_def, ty)),
                             );
                             return Ok(());
@@ -439,6 +442,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         *e = variable_from_parameter_index(
                             ctx.get_new_rowid_param()
                                 .expect("NEW parameters must be provided"),
+                            &written_col,
                             None,
                         );
                         return Ok(());
@@ -461,6 +465,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             *e = variable_from_parameter_index(
                                 ctx.get_old_rowid_param()
                                     .expect("OLD parameters must be provided"),
+                                &written_col,
                                 Some((col_def, ty)),
                             );
                             return Ok(());
@@ -469,6 +474,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             *e = variable_from_parameter_index(
                                 ctx.get_old_param(idx)
                                     .expect("OLD parameters must be provided"),
+                                &written_col,
                                 Some((col_def, ty)),
                             );
                             return Ok(());
@@ -481,6 +487,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         *e = variable_from_parameter_index(
                             ctx.get_old_rowid_param()
                                 .expect("OLD parameters must be provided"),
+                            &written_col,
                             None,
                         );
                         return Ok(());
@@ -1356,10 +1363,14 @@ fn rewrite_trigger_expr_single_for_when_clause(
     allow_non_trigger_qualified: bool,
 ) -> Result<()> {
     let table = &ctx.table;
-    let decoded_column = |register: usize, column: usize| Expr::Register {
-        register,
-        custom_type: column_types[column].clone(),
-    };
+    // The register carries the column name as written in NEW.x or OLD.x,
+    // so a subquery column that selects it is named x.
+    let named_register =
+        |register: usize, custom_type: Option<Box<ast::Type>>, name: &str| Expr::Register {
+            register,
+            custom_type,
+            column_name: Some(name.into()),
+        };
     match expr {
         // Bare column references are not valid in trigger WHEN clauses.
         // Per SQLite docs, columns must be qualified with NEW or OLD.
@@ -1382,7 +1393,8 @@ fn rewrite_trigger_expr_single_for_when_clause(
         }
         Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
             let ns = normalize_ident(ns.as_str());
-            let col = normalize_ident(col.as_str());
+            let written_col = col.as_str().to_string();
+            let col = normalize_ident(&written_col);
 
             // Handle NEW.column references
             if ns.eq_ignore_ascii_case("new") {
@@ -1390,24 +1402,32 @@ fn rewrite_trigger_expr_single_for_when_clause(
                     if let Some((idx, col_def)) = table.get_column(&col) {
                         if col_def.is_rowid_alias() {
                             // Rowid alias columns map to the rowid register (last element)
-                            *expr = Expr::register(
+                            *expr = named_register(
                                 *new_regs.last().expect("NEW registers must be provided"),
+                                None,
+                                &written_col,
                             );
                             return Ok(());
                         }
                         if idx < new_regs.len() {
-                            *expr = decoded_column(new_regs[idx], idx);
+                            *expr = named_register(
+                                new_regs[idx],
+                                column_types[idx].clone(),
+                                &written_col,
+                            );
                             return Ok(());
                         }
                     }
                     // Handle NEW.rowid
                     if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
-                        *expr = Expr::register(
+                        *expr = named_register(
                             *ctx.new_registers
                                 .as_ref()
                                 .expect("NEW registers must be provided")
                                 .last()
                                 .expect("NEW registers must be provided"),
+                            None,
+                            &written_col,
                         );
                         return Ok(());
                     }
@@ -1424,18 +1444,24 @@ fn rewrite_trigger_expr_single_for_when_clause(
                 if let Some(old_regs) = &ctx.old_registers {
                     if let Some((idx, _)) = table.get_column(&col) {
                         if idx < old_regs.len() {
-                            *expr = decoded_column(old_regs[idx], idx);
+                            *expr = named_register(
+                                old_regs[idx],
+                                column_types[idx].clone(),
+                                &written_col,
+                            );
                             return Ok(());
                         }
                     }
                     // Handle OLD.rowid
                     if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&col)) {
-                        *expr = Expr::register(
+                        *expr = named_register(
                             *ctx.old_registers
                                 .as_ref()
                                 .expect("OLD registers must be provided")
                                 .last()
                                 .expect("OLD registers must be provided"),
+                            None,
+                            &written_col,
                         );
                         return Ok(());
                     }

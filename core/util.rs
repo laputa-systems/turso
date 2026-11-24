@@ -744,7 +744,32 @@ fn exprs_match(expr1: &Expr, expr2: &Expr, operands_can_swap: bool) -> bool {
         (Expr::Unary(op1, expr1), Expr::Unary(op2, expr2)) => {
             op1 == op2 && exprs_match(expr1, expr2, operands_can_swap)
         }
-        (Expr::Variable(val), Expr::Variable(val2)) => val == val2,
+        (Expr::Variable(val), Expr::Variable(val2)) => {
+            // `column_name` only names a subquery column: NEW.X and new.x, or
+            // new.rowid and new.oid, hold the same value.
+            ast::Variable {
+                column_name: None,
+                ..val.clone()
+            } == ast::Variable {
+                column_name: None,
+                ..val2.clone()
+            }
+        }
+        (
+            Expr::Register {
+                register: register1,
+                custom_type: custom_type1,
+                ..
+            },
+            Expr::Register {
+                register: register2,
+                custom_type: custom_type2,
+                ..
+            },
+        ) => {
+            // As for a Variable, `column_name` only names a subquery column.
+            register1 == register2 && custom_type1 == custom_type2
+        }
         (Expr::Parenthesized(exprs1), Expr::Parenthesized(exprs2)) => {
             exprs1.len() == exprs2.len()
                 && exprs1
@@ -1404,13 +1429,19 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
     ))
 }
 
-/// Extract column name from an expression (e.g., for SELECT clauses)
+/// Extract column name from an expression (e.g., for SELECT clauses).
+/// Like SQLite's sqlite3ColumnsFromExprList(), it looks through parentheses
+/// and COLLATE, so `(x)` and `x COLLATE nocase` are named x.
 pub fn extract_column_name_from_expr(expr: impl AsRef<ast::Expr>) -> Option<String> {
     match expr.as_ref() {
         ast::Expr::Id(name) => Some(name.as_str().to_string()),
         ast::Expr::DoublyQualified(_, _, name) | ast::Expr::Qualified(_, name) => {
             Some(normalize_ident(name.as_str()))
         }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            extract_column_name_from_expr(&exprs[0])
+        }
+        ast::Expr::Collate(inner, _) => extract_column_name_from_expr(inner),
         _ => None,
     }
 }

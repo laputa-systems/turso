@@ -525,6 +525,11 @@ pub enum Expr {
         /// The custom type of the decoded column value the register holds, so
         /// that operators on it work as they do on the column.
         custom_type: Option<Box<Type>>,
+        /// The column name as written in the trigger reference the register
+        /// replaces: `x` for `NEW.x` or `OLD.x` in a WHEN clause. As in
+        /// SQLite, a subquery column that selects `NEW.x` gets this name.
+        #[cfg_attr(feature = "serde", serde(default))]
+        column_name: Option<Box<str>>,
     },
     /// `CASE` expression
     Case {
@@ -730,6 +735,11 @@ pub struct Variable {
     /// they use a column's collation.
     #[cfg_attr(feature = "serde", serde(default))]
     pub col_collation: Option<Box<str>>,
+    /// The column name as written in the trigger reference the variable
+    /// replaces: `x` for `NEW.x` or `OLD.x`. As in SQLite, a subquery column
+    /// that selects `NEW.x` gets this name, so the outer query can select `x`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub column_name: Option<Box<str>>,
     /// True for an explicit `?N` marker. Numbered markers carry no allocated
     /// name; their "?N" spelling is derived from the index on demand.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -743,6 +753,7 @@ impl Variable {
             name: None,
             custom_type: None,
             col_collation: None,
+            column_name: None,
             numbered: false,
         }
     }
@@ -754,6 +765,7 @@ impl Variable {
             name: None,
             custom_type: None,
             col_collation: None,
+            column_name: None,
             numbered: true,
         }
     }
@@ -770,6 +782,7 @@ impl Variable {
             name: None,
             custom_type: custom_type.map(Box::new),
             col_collation: col_collation.map(Into::into),
+            column_name: None,
             numbered: false,
         }
     }
@@ -780,6 +793,7 @@ impl Variable {
             name: Some(name.into()),
             custom_type: None,
             col_collation: None,
+            column_name: None,
             numbered: false,
         }
     }
@@ -835,6 +849,7 @@ impl Expr {
         Expr::Register {
             register,
             custom_type: None,
+            column_name: None,
         }
     }
 

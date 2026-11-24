@@ -2157,6 +2157,7 @@ fn rewrite_expr_to_registers(
     let decoded_column = |register: usize, column: usize| Expr::Register {
         register,
         custom_type: decoded_column_types.and_then(|types| types[column].clone()),
+        column_name: None,
     };
 
     // Map a column name to its register within the row image at `base_start`.

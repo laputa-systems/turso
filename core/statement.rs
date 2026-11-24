@@ -1241,7 +1241,7 @@ impl Statement {
                 let short = self.connection.get_short_column_names();
 
                 // 2. For column references, apply full/short column name logic.
-                match &column.expr {
+                match crate::translate::expr::unwrap_parens(&column.expr).unwrap_or(&column.expr) {
                     crate::ast::Expr::Column {
                         table,
                         column: col_idx,

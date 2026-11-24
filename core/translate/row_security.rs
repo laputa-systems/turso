@@ -535,6 +535,7 @@ fn compute_scalar_selects_once(
         *expr = ast::Expr::Register {
             register,
             custom_type: None,
+            column_name: None,
         };
         Ok(WalkControl::SkipChildren)
     })?;

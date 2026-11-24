@@ -639,6 +639,7 @@ pub(super) fn emit_domain_cast_constraints(
                     *e = ast::Expr::Register {
                         register: reg,
                         custom_type: Some(Box::new(cast_type.clone())),
+                        column_name: None,
                     };
                 }
                 Ok(WalkControl::Continue)
