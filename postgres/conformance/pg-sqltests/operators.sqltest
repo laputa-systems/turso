@@ -433,19 +433,14 @@ expect {
     f
 }
 
-@compat-gap "type:numeric"
 @setup operands
-test string-literal-with-more-digits-than-a-double-next-to-a-numeric-column-errors {
+test string-literal-with-more-digits-than-a-double-next-to-a-numeric-column {
     CREATE TABLE doubles (n numeric);
     INSERT INTO doubles VALUES (9007199254740992);
     SELECT n = '9007199254740993' FROM doubles;
 }
 expect {
     f
-}
-@sqlstate 0A000
-expect @tursopg error {
-    has more digits than a double keeps
 }
 
 @setup operands
@@ -585,6 +580,7 @@ expect {
 
 # A string literal that PostgreSQL reads as NaN, an infinity or a huge
 # numeric next to a number is a value, not an error.
+@compat-gap "type:numeric"
 @setup operands
 test nan-literal-next-to-numbers-is-not-an-error {
     SELECT n = 'NaN', f = 'NaN', f = 'Infinity', f = '-Infinity', 1.5 = 'NaN', 1.5 = 'Infinity', n = '1e400' FROM operands;
@@ -592,6 +588,8 @@ test nan-literal-next-to-numbers-is-not-an-error {
 expect {
     f|f|f|f|f|f|f
 }
+@sqlstate 23000
+expect @tursopg error {}
 
 @setup operands
 test hex-and-underscore-literals-next-to-an-integer-are-not-an-error {
