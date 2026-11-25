@@ -7,7 +7,6 @@ mod config;
 mod dot_command;
 #[path = "../../cli/helper.rs"]
 mod helper;
-mod read_state_machine;
 
 // Stubs for shared modules that reference crate-level types from the tursodb binary.
 // tursopg doesn't use these codepaths, but the types must exist so shared code compiles.
@@ -30,7 +29,6 @@ use clap::Parser;
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
 use config::{TableConfig, CONFIG_DIR};
 use helper::LimboHelper;
-use read_state_machine::ReadState;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::Editor;
@@ -45,6 +43,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso_core::{OpenFlags, SessionRole, Value};
 use turso_pg::{Connection, Error, Statement};
+use turso_pg_scanner::{Scanner, Segment};
 use turso_pg_server::TursoPgServer;
 
 // ---------------------------------------------------------------------------
@@ -797,7 +796,13 @@ struct Repl {
     db_file: String,
     table_config: TableConfig,
     input_buf: String,
-    read_state: ReadState,
+    /// The statement to send, as the scanner reads `input_buf`: the same
+    /// text, but with `;` and `:` for `\;` and `\:`, as psql sends it.
+    sql_buf: String,
+    /// The statements that the input has ended so far, which run one at a
+    /// time and in order, as psql runs them.
+    statements: Vec<String>,
+    scanner: Scanner,
     interrupt_count: Arc<AtomicUsize>,
     had_error: bool,
     expanded_display: bool,
@@ -818,7 +823,9 @@ impl Repl {
             db_file,
             table_config,
             input_buf: String::new(),
-            read_state: ReadState::default(),
+            sql_buf: String::new(),
+            statements: Vec::new(),
+            scanner: Scanner::default(),
             interrupt_count,
             had_error: false,
             expanded_display: false,
@@ -836,7 +843,32 @@ impl Repl {
 
     fn reset_input(&mut self) {
         self.input_buf.clear();
-        self.read_state = ReadState::default();
+        self.sql_buf.clear();
+        self.statements.clear();
+        self.scanner = Scanner::default();
+    }
+
+    /// Reads the input from byte `from` of `input_buf` on, and adds it to
+    /// the statement to send.
+    fn scan_input(&mut self, from: usize) {
+        let Self {
+            input_buf,
+            sql_buf,
+            statements,
+            scanner,
+            ..
+        } = self;
+        scanner.scan(&input_buf[from..], |segment| match segment {
+            Segment::Code(text)
+            | Segment::Quoted(text)
+            | Segment::LineComment(text)
+            | Segment::Variable { text, .. }
+            | Segment::MetaCommand(text) => sql_buf.push_str(text),
+            Segment::End => {
+                sql_buf.push(';');
+                statements.push(std::mem::take(sql_buf));
+            }
+        });
     }
 
     fn consume(&mut self, flush: bool) {
@@ -864,33 +896,49 @@ impl Repl {
             return;
         }
 
-        let is_complete = self.read_state.is_complete();
-        if is_complete || flush {
-            let sql = self.input_buf.clone();
-            let start = if self.timing {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let had_err = execute_sql(
-                &self.conn,
-                sql.trim(),
-                &self.table_config,
-                self.expanded_display,
-                &mut std::io::stdout(),
-            );
-            if let Some(start) = start {
-                let elapsed = start.elapsed();
-                let _ = writeln!(
-                    std::io::stdout(),
-                    "Time: {:.3}ms",
-                    elapsed.as_secs_f64() * 1000.0
-                );
-            }
-            if had_err {
-                self.had_error = true;
-            }
+        for sql in std::mem::take(&mut self.statements) {
+            self.run_sql(&sql);
+        }
+        // At the end of the input, psql sends what is left without a
+        // semicolon.
+        if flush {
+            let sql = std::mem::take(&mut self.sql_buf);
+            self.run_sql(&sql);
+        }
+        if self.scanner.is_complete() || flush {
             self.reset_input();
+        }
+    }
+
+    /// Runs one statement and prints its result.
+    fn run_sql(&mut self, sql: &str) {
+        let sql = sql.trim();
+        // psql would send an empty query, which prints nothing.
+        if sql.is_empty() || sql == ";" {
+            return;
+        }
+        let start = if self.timing {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let had_err = execute_sql(
+            &self.conn,
+            sql,
+            &self.table_config,
+            self.expanded_display,
+            &mut std::io::stdout(),
+        );
+        if let Some(start) = start {
+            let elapsed = start.elapsed();
+            let _ = writeln!(
+                std::io::stdout(),
+                "Time: {:.3}ms",
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+        if had_err {
+            self.had_error = true;
         }
     }
 
@@ -927,11 +975,12 @@ impl Repl {
                     }
 
                     self.interrupt_count.store(0, Ordering::Release);
-                    self.read_state.process(&line);
+                    let prev_len = self.input_buf.len();
+                    // The newline ends a `--` comment of the line, also in
+                    // the text that goes to the server.
                     self.input_buf.push_str(&line);
-                    if !self.input_buf.ends_with(char::is_whitespace) {
-                        self.input_buf.push('\n');
-                    }
+                    self.input_buf.push('\n');
+                    self.scan_input(prev_len);
                     self.consume(false);
                 }
                 Err(ReadlineError::Interrupted) => {
@@ -965,7 +1014,7 @@ impl Repl {
                 self.consume(true);
                 break;
             }
-            self.read_state.process(&self.input_buf[prev_len..]);
+            self.scan_input(prev_len);
             self.consume(false);
         }
     }

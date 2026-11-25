@@ -57,6 +57,100 @@ fn position_in_form_returns_index() {
     );
 }
 
+/// A semicolon at the end of a line inside a quoted string that spans
+/// lines does not end the statement.
+#[test]
+fn quoted_string_over_several_lines_with_semicolons() {
+    let output = run_tursopg(
+        b"SELECT length('a\nb;\nc') + 100 AS a;\nSELECT length($$a\nb;\nc$$) + 200 AS b;\nSELECT 'done' AS c;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    for expected in ["106", "206", "done"] {
+        assert!(out.contains(expected), "expected {expected}: {out}");
+    }
+    assert!(!out.contains("ERROR"), "{out}");
+}
+
+/// A semicolon at the end of a line inside a nested block comment, or after
+/// an escaped quote of an `E''` string, does not end the statement, as in
+/// psql.
+#[test]
+fn nested_comment_and_escape_string_over_several_lines() {
+    let output = run_tursopg(
+        b"SELECT /* a /* b */ ;\n */ 101 AS n;\nSELECT length(E'a\\';\nb') + 200 AS e;\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    for expected in ["101", "205"] {
+        assert!(out.contains(expected), "expected {expected}: {out}");
+    }
+    assert!(!out.contains("ERROR"), "{out}");
+}
+
+/// An escaped quote in an `E''` string, and an identifier with `$` in it,
+/// do not leave the shell inside a quoted string: each statement runs when
+/// its line ends, and so does the backslash command after it.
+#[test]
+fn escape_string_and_identifier_with_dollar_end_their_statements() {
+    let output = run_tursopg(
+        b"SELECT E'a\\'b' AS x;\nSELECT 2 AS y;\n\\echo hi\nSELECT 1 AS a$b$;\nSELECT 3 AS z;\n\\echo bye\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    let positions: Vec<usize> = ["a'b", "hi", "a$b$", "z", "bye"]
+        .iter()
+        .map(|expected| {
+            out.find(expected)
+                .unwrap_or_else(|| panic!("expected {expected}: {out}"))
+        })
+        .collect();
+    assert!(positions.is_sorted(), "{out}");
+    assert!(!out.contains("ERROR"), "{out}");
+}
+
+/// `\;` puts a semicolon into the statement without ending it, as in
+/// psql, so both statements go to the server together, and the next line
+/// is a statement of its own.
+#[test]
+fn backslash_semicolon_does_not_end_the_statement() {
+    let output = run_tursopg(b"SELECT 1 AS a \\; SELECT 2 AS b;\nSELECT 3 AS c;\n");
+    assert_eq!(output.status.code(), Some(0));
+    let out = stdout(&output);
+    assert!(out.contains(" c "), "{out}");
+    assert!(out.contains('3'), "{out}");
+    assert!(!out.contains("ERROR"), "{out}");
+    assert!(!out.contains("invalid command"), "{out}");
+}
+
+/// Each statement of a line runs on its own, as in psql: an error in one
+/// does not keep the one before it from running and printing its rows.
+#[test]
+fn statements_of_one_line_run_one_at_a_time() {
+    let output = run_tursopg(b"SELECT 1 AS one; selecgt 2;\nSELECT 3 AS three;\n");
+    let out = stdout(&output);
+    let one = out
+        .find(" one")
+        .unwrap_or_else(|| panic!("expected one: {out}"));
+    let three = out
+        .find(" three")
+        .unwrap_or_else(|| panic!("expected three: {out}"));
+    assert!(one < three, "{out}");
+}
+
+/// CREATE TRIGGER is an ordinary statement in PostgreSQL. The shell read it
+/// as SQLite's CREATE TRIGGER, whose body ends with `END;`, and so took every
+/// statement after it as part of the trigger.
+#[test]
+fn statement_after_create_trigger_runs() {
+    let output = run_tursopg(
+        b"CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();\nSELECT 42 AS after_trigger;\n",
+    );
+    let out = stdout(&output);
+    assert!(out.contains("after_trigger"), "{out}");
+    assert!(out.contains("42"), "{out}");
+}
+
 #[test]
 fn create_table_then_select() {
     let output = run_tursopg(
