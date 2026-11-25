@@ -106,7 +106,7 @@ impl CollationSeq {
             Self::Text(TextCollation::Rtrim) => 3,
             Self::Text(TextCollation::Locale(id)) => id.to_bits(),
             Self::Text(TextCollation::Custom(_)) => Self::NO_COLLATION_BITS,
-            Self::Type(ordering) => Self::FIRST_TYPE_ORDERING_BITS + ordering as u16,
+            Self::Type(ordering) => Self::FIRST_TYPE_ORDERING_BITS + ordering.number(),
         }
     }
 
@@ -772,9 +772,9 @@ fn common_ordering(
         }
     }
     match (found, array_of_unknown_elements) {
-        (None, Some(_)) => Ok(Some(TypeOrdering::Array)),
+        (None, Some(_)) => Ok(Some(TypeOrdering::ARRAY)),
         (Some((other, other_ty)), Some(array_ty))
-            if !matches!(other, TypeOrdering::Array | TypeOrdering::TextArray) =>
+            if !matches!(other, TypeOrdering::ARRAY | TypeOrdering::TEXT_ARRAY) =>
         {
             Err(cannot_compare(other_ty, array_ty))
         }
