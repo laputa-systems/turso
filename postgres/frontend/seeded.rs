@@ -20,21 +20,64 @@ const SCAN: i32 = 0;
 /// `idx_num` of a lookup of the row whose rowid is the first argument.
 const FIND: i32 = 1;
 
-/// The virtual table of a catalog that has the rows of a seed, and the
-/// hidden system column `tableoid` after the columns of the seed.
+/// The virtual table of a catalog that has the rows of a seed. It can have
+/// the hidden system column `tableoid` after the columns of the seed.
 #[derive(Clone, Copy)]
 pub(crate) struct SeededCatalog {
     table: &'static SeededTable,
     /// The oid of the catalog in `pg_class`, which is the `tableoid` of
     /// each row. It is the number of the `create` line of the catalog in
-    /// `postgres.bki`.
-    table_oid: i64,
+    /// `postgres.bki`. None for a catalog without the column: a catalog
+    /// that a statement can store has the columns of the stored table and
+    /// no other.
+    table_oid: Option<i64>,
 }
 
 impl SeededCatalog {
-    pub(crate) const fn new(table: &'static SeededTable, table_oid: i64) -> Self {
+    pub(crate) const fn new(table: &'static SeededTable, table_oid: Option<i64>) -> Self {
         Self { table, table_oid }
     }
+}
+
+/// The engine statements that store `table`: they create the table and its
+/// indexes, and insert the rows of the seed. The frontend runs them before
+/// the first statement that writes to the catalog. The stored table then
+/// has the name in place of the virtual table.
+pub(crate) fn store_statements(table: &SeededTable) -> Result<Vec<String>> {
+    let seed = table.seed;
+    let mut statements = Vec::with_capacity(1 + table.index_sql.len() + seed.len());
+    statements.push(table.create_sql.to_string());
+    statements.extend(table.index_sql.iter().map(|sql| sql.to_string()));
+    let mut row = Vec::new();
+    for index in 0..seed.len() {
+        row.clear();
+        seed.row(index, &mut row);
+        let values = row
+            .iter()
+            .map(sql_literal)
+            .collect::<Result<Vec<String>>>()?;
+        statements.push(format!(
+            "INSERT INTO {} VALUES ({})",
+            table.name,
+            values.join(", ")
+        ));
+    }
+    Ok(statements)
+}
+
+/// `value` as a literal of SQLite.
+fn sql_literal(value: &Value) -> Result<String> {
+    Ok(match value {
+        Value::Null => "NULL".to_string(),
+        Value::Numeric(Numeric::Integer(integer)) => integer.to_string(),
+        Value::Numeric(Numeric::Float(real)) => format!("{:?}", f64::from(*real)),
+        Value::Text(text) => format!("'{}'", text.as_str().replace('\'', "''")),
+        Value::Blob(_) => {
+            return Err(LimboError::InternalError(
+                "a seed row has a blob, which no catalog of PostgreSQL has".to_string(),
+            ))
+        }
+    })
 }
 
 impl std::fmt::Debug for SeededCatalog {
@@ -57,7 +100,10 @@ impl VirtualTableModule for SeededCatalog {
                 self.table.name
             )));
         };
-        Ok(format!("{columns}, tableoid INTEGER HIDDEN)"))
+        Ok(match self.table_oid {
+            Some(_) => format!("{columns}, tableoid INTEGER HIDDEN)"),
+            None => self.table.create_sql.to_string(),
+        })
     }
 
     fn create(&self, _args: &[Value]) -> Result<Self::Table> {
@@ -236,7 +282,10 @@ impl VirtualTableCursor for SeededCursor {
         let value = match self.position {
             Position::Done => Value::Null,
             // `tableoid` is the column after the columns of the seed.
-            _ if column == self.row.len() => Value::from_i64(self.catalog.table_oid),
+            _ if column == self.row.len() => match self.catalog.table_oid {
+                Some(table_oid) => Value::from_i64(table_oid),
+                None => Value::Null,
+            },
             _ => self.row[column].clone(),
         };
         Ok(IOResult::Done(value))

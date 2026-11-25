@@ -485,6 +485,13 @@ pub(crate) fn row_security_policies<'a>(
 pub(crate) struct PostgresCatalog;
 
 impl Catalog for PostgresCatalog {
+    /// `pg_description` has the built-in comments before a statement stores
+    /// it. The first COMMENT ON stores it, and the stored table then has
+    /// the name in place of the virtual table.
+    fn seeded_tables(&self) -> &'static [&'static str] {
+        &[crate::descriptions::DESCRIPTION_TABLE_NAME]
+    }
+
     fn emit(
         &self,
         program: &mut ProgramBuilder,

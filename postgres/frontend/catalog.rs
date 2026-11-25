@@ -2861,7 +2861,7 @@ static PG_COLLATION_SEEDED_TABLE: turso_pg_catalog::SeededTable =
 /// `pg_class` is 3456, as the line `create pg_collation 3456` of
 /// `postgres.bki` says.
 const PG_COLLATION_CATALOG: crate::seeded::SeededCatalog =
-    crate::seeded::SeededCatalog::new(&PG_COLLATION_SEEDED_TABLE, 3456);
+    crate::seeded::SeededCatalog::new(&PG_COLLATION_SEEDED_TABLE, Some(3456));
 
 pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions {
     options = options.native_module(
@@ -3051,6 +3051,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         "pg_collation",
         VTabKind::TableValuedFunction,
         PG_COLLATION_CATALOG,
+    );
+    options = options.native_module(
+        crate::descriptions::DESCRIPTION_TABLE_NAME,
+        VTabKind::TableValuedFunction,
+        crate::descriptions::SEEDED_CATALOG,
     );
     options = options.native_module(
         "pg_seclabels",

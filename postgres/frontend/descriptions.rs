@@ -7,7 +7,12 @@
 //! and schemas have comments. `COMMENT ON` any other kind of object is
 //! refused.
 //!
-//! Nothing in memory holds these rows. `COMMENT ON` writes them with
+//! `pg_description` is a seeded table. A database has the built-in comments
+//! before anything is stored: a virtual table serves them from memory. The
+//! first statement that writes a comment stores the table with the built-in
+//! comments, and the stored table then has the name.
+//!
+//! Nothing in memory holds the stored rows. `COMMENT ON` writes them with
 //! statements of the engine in the user's transaction, and
 //! `obj_description` and `col_description` are queries on the table.
 //! A statement that drops a relation or a column deletes its comments in
@@ -20,8 +25,9 @@ use turso_core::namespace::NamespaceId;
 use turso_core::schema::{RelationKind, Schema};
 use turso_core::{
     to_u32, CmpInsFlags, CollationSeq, Connection, CursorType, InsertFlags, Insn, ProgramBuilder,
-    RegisterOrLiteral, Result, MAIN_DB_ID,
+    RegisterOrLiteral, Result, Value, MAIN_DB_ID,
 };
+use turso_pg_catalog::{Seed, SeededTable};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_SCHEMA_NAME,
     SQLSTATE_UNDEFINED_COLUMN, SQLSTATE_UNDEFINED_TABLE, SQLSTATE_WRONG_OBJECT_TYPE,
@@ -34,7 +40,7 @@ use crate::catalog::{key_constraint_names, namespace_oid, PUBLIC_NAMESPACE_OID};
 use crate::classes::{class_catalog, RelationClass};
 use crate::error::sqlstate_error;
 use crate::roles::schema_roles;
-use crate::schema_init::TableInit;
+use crate::seeded::SeededCatalog;
 use crate::session::relation_lookup_namespaces;
 
 pub(crate) const DESCRIPTION_TABLE_NAME: &str = "pg_description";
@@ -48,51 +54,120 @@ const DESCRIPTION_COLUMN_COUNT: usize = 4;
 const CREATE_DESCRIPTION_TABLE_SQL: &str = "CREATE TABLE pg_description \
      (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)";
 
-/// The comment that PostgreSQL gives the public schema.
-const INSERT_PUBLIC_SCHEMA_COMMENT_SQL: &str =
-    "INSERT INTO pg_description (objoid, classoid, objsubid, description) \
-     VALUES (2200, 2615, 0, 'standard public schema')";
+/// The comments that a database has before a statement stores one: the
+/// comment that PostgreSQL gives the public schema.
+struct BuiltinComments;
 
-// The statement above spells the oids so that it can be a constant.
-const _: () = assert!(PUBLIC_NAMESPACE_OID == 2200 && PG_NAMESPACE_OID == 2615);
+/// The object, the catalog of the object and the text of each built-in
+/// comment.
+const BUILTIN_COMMENTS: [(i64, i64, &str); 1] = [(
+    PUBLIC_NAMESPACE_OID,
+    PG_NAMESPACE_OID,
+    "standard public schema",
+)];
 
-pub(crate) const TABLE_INIT: TableInit = TableInit {
-    table: DESCRIPTION_TABLE_NAME,
-    statements: &[
-        CREATE_DESCRIPTION_TABLE_SQL,
-        INSERT_PUBLIC_SCHEMA_COMMENT_SQL,
-    ],
+impl Seed for BuiltinComments {
+    fn len(&self) -> usize {
+        BUILTIN_COMMENTS.len()
+    }
+
+    fn row(&self, index: usize, out: &mut Vec<Value>) {
+        let (objoid, classoid, description) = BUILTIN_COMMENTS[index];
+        out.extend([
+            Value::from_i64(objoid),
+            Value::from_i64(classoid),
+            Value::from_i64(0),
+            Value::build_text(description),
+        ]);
+    }
+
+    fn rowid_column(&self) -> Option<usize> {
+        None
+    }
+
+    fn find(&self, rowid: i64) -> Option<usize> {
+        usize::try_from(rowid)
+            .ok()?
+            .checked_sub(1)
+            .filter(|index| *index < BUILTIN_COMMENTS.len())
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+/// `pg_description` as a seeded table. A database has the built-in comments
+/// before anything is stored, and the first statement that writes a comment
+/// stores the table with them.
+pub(crate) static SEEDED_TABLE: SeededTable = SeededTable {
+    name: DESCRIPTION_TABLE_NAME,
+    create_sql: CREATE_DESCRIPTION_TABLE_SQL,
+    index_sql: &[],
+    seed: &BuiltinComments,
 };
 
-/// The engine statements that `stmt` runs: they replace the comment of its
-/// object, or delete it.
+/// The virtual table that serves the built-in comments while
+/// `pg_description` is not stored. It has the columns of the stored table.
+pub(crate) const SEEDED_CATALOG: SeededCatalog = SeededCatalog::new(&SEEDED_TABLE, None);
+
+/// Whether `pg_description` is stored in the database of `schema`.
+fn is_stored(schema: &Schema) -> bool {
+    schema
+        .get_btree_table(NamespaceId::ROOT, DESCRIPTION_TABLE_NAME)
+        .is_some()
+}
+
+/// The engine statements that store `pg_description` with the built-in
+/// comments, or none when it is stored.
+fn store_statements(schema: &Schema) -> Result<Vec<String>> {
+    if is_stored(schema) {
+        return Ok(Vec::new());
+    }
+    crate::seeded::store_statements(&SEEDED_TABLE)
+}
+
+/// The engine statements that `stmt` runs: they store `pg_description` when
+/// this is the first statement that writes to it, and they replace the
+/// comment of the object of `stmt`, or delete it.
 pub(crate) fn comment_statements(
     conn: &Arc<Connection>,
     stmt: &PgCommentOnStmt,
 ) -> Result<Vec<String>> {
     let object = described_object(conn, &stmt.object)?;
-    let mut statements = vec![object.delete_statement()];
+    let mut statements = store_statements(&conn.current_schema())?;
+    statements.push(object.delete_statement());
     if let Some(comment) = &stmt.comment {
         statements.push(object.insert_statement(comment));
     }
     Ok(statements)
 }
 
-/// The engine statement that deletes the comment of the schema `namespace`
-/// of `schema`, which the running statement drops. None when the database
-/// has no table of comments, which only happens outside the frontend's own
-/// open path, such as a core-level open for tests.
-pub(crate) fn delete_schema_comment_statement(
+/// The engine statements that delete the comment of the schema `namespace`
+/// of `schema`, which the running statement drops.
+///
+/// When `pg_description` is not stored, only a built-in comment can be the
+/// comment of the schema. The statements then store the table first, so
+/// that the comment can be deleted. For a schema without a built-in
+/// comment there is nothing to delete, and nothing is stored.
+pub(crate) fn delete_schema_comment_statements(
     schema: &Schema,
     namespace: NamespaceId,
-) -> Option<String> {
-    schema.get_btree_table(NamespaceId::ROOT, DESCRIPTION_TABLE_NAME)?;
+) -> Result<Vec<String>> {
     let comment = DescribedObject {
         objoid: namespace_oid(schema, namespace),
         classoid: PG_NAMESPACE_OID,
         objsubid: 0,
     };
-    Some(comment.delete_statement())
+    let has_builtin_comment = BUILTIN_COMMENTS
+        .iter()
+        .any(|(objoid, classoid, _)| (*objoid, *classoid) == (comment.objoid, comment.classoid));
+    if !is_stored(schema) && !has_builtin_comment {
+        return Ok(Vec::new());
+    }
+    let mut statements = store_statements(schema)?;
+    statements.push(comment.delete_statement());
+    Ok(statements)
 }
 
 /// What `pg_description` names an object by.
