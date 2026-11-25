@@ -761,6 +761,8 @@ pub fn emit_upsert(
         &layout,
     )?;
     let set_pairs = &collect_set_clauses_for_upsert(table, sets, resolver)?;
+    let converts_values_before_not_null =
+        resolver.catalog.dialect.converts_values_before_not_null();
     let mut new_rowid_reg: Option<usize> = None;
     for (col_idx, expr) in set_pairs {
         if *col_idx == ROWID_SENTINEL {
@@ -790,24 +792,19 @@ pub fn emit_upsert(
             .cloned();
         let prev_union = program.target_union_type.take();
         program.target_union_type = union_td;
+        let set_value_reg = layout.to_register(new_start, *col_idx);
         let translate_result = translate_expr_no_constant_opt(
             program,
             None,
             expr,
-            layout.to_register(new_start, *col_idx),
+            set_value_reg,
             resolver,
             NoConstantOptReason::RegisterReuse,
         );
         program.target_union_type = prev_union;
         translate_result?;
-        if col.notnull() && !col.is_rowid_alias() {
-            program.emit_insn(Insn::HaltIfNull {
-                constraint_info: None,
-                target_reg: layout.to_register(new_start, *col_idx),
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
-                on_error: constraint_on_error,
-            });
+        if !converts_values_before_not_null {
+            emit_set_value_notnull_check(program, table, col, set_value_reg, constraint_on_error);
         }
         if col.is_rowid_alias() {
             // Must be integer; remember the NEW rowid value
@@ -844,6 +841,13 @@ pub fn emit_upsert(
             StatementValues::of_insert(program),
             &sources,
         )?;
+    }
+    if converts_values_before_not_null {
+        for (col_idx, _) in set_pairs.iter().filter(|(idx, _)| *idx != ROWID_SENTINEL) {
+            let col = &table.columns()[*col_idx];
+            let set_value_reg = layout.to_register(new_start, *col_idx);
+            emit_set_value_notnull_check(program, table, col, set_value_reg, constraint_on_error);
+        }
     }
 
     // Recompute generated columns for the new row after SET clauses have modified base columns.
@@ -1935,6 +1939,24 @@ fn do_update_constraint_on_error(program: &ProgramBuilder) -> Option<ast::Resolv
         None
     } else {
         Some(ast::ResolveType::Abort)
+    }
+}
+
+fn emit_set_value_notnull_check(
+    program: &mut ProgramBuilder,
+    table: &Table,
+    column: &Column,
+    set_value_reg: usize,
+    on_error: Option<ast::ResolveType>,
+) {
+    if column.notnull() && !column.is_rowid_alias() {
+        program.emit_insn(Insn::HaltIfNull {
+            constraint_info: None,
+            target_reg: set_value_reg,
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: String::from(table.get_name()) + "." + column.name.as_ref().unwrap(),
+            on_error,
+        });
     }
 }
 
