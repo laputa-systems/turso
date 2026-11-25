@@ -71,6 +71,10 @@ impl TypeOrdering {
         Self(def)
     }
 
+    pub(crate) fn same_definition(self, other: Self) -> bool {
+        std::ptr::eq(self.0, other.0)
+    }
+
     /// The name EXPLAIN shows for the order.
     pub const fn name(self) -> &'static str {
         self.0.name
