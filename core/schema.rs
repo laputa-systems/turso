@@ -471,6 +471,10 @@ pub struct TypeDef {
     /// `Schema::refuses_non_text_input`). False for a domain, user type and
     /// STRUCT or UNION; a domain takes the answer of the types under it.
     pub casts_to_numbers_and_booleans: bool,
+    /// Whether a column or a CAST may leave out the parameters of the type
+    /// (see `Type::params_may_be_omitted`). False for a domain, user type and
+    /// STRUCT or UNION.
+    pub params_may_be_omitted: bool,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -797,6 +801,7 @@ impl TypeDef {
                     stored_form_sorts_in_value_order: false,
                     is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
+                    params_may_be_omitted: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -834,6 +839,7 @@ impl TypeDef {
                     stored_form_sorts_in_value_order: false,
                     is_type_of_conditions: false,
                     casts_to_numbers_and_booleans: false,
+                    params_may_be_omitted: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -865,6 +871,7 @@ impl TypeDef {
             stored_form_sorts_in_value_order: ty.stored_form_sorts_in_value_order(),
             is_type_of_conditions: ty.is_type_of_conditions(),
             casts_to_numbers_and_booleans: ty.casts_to_numbers_and_booleans(),
+            params_may_be_omitted: ty.params_may_be_omitted(),
             sql,
             domain_checks: std::vec::Vec::new(),
             kind: TypeDefKind::Custom {
@@ -903,6 +910,7 @@ impl TypeDef {
             stored_form_sorts_in_value_order: false,
             is_type_of_conditions: false,
             casts_to_numbers_and_booleans: false,
+            params_may_be_omitted: false,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
