@@ -6,6 +6,8 @@
 mod boolean;
 mod numeric;
 
+pub use numeric::check_pg_numeric;
+
 use crate::session::relation_lookup_namespaces;
 use std::sync::Arc;
 use turso_core::schema::{RelationKind, SchemaBuilder};
