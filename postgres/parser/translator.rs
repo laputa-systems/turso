@@ -3585,7 +3585,7 @@ impl PostgreSQLTranslator {
                     .type_name
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("TypeCast missing type name".into()))?;
-                if !pg_type_name.typmods.is_empty() {
+                if !pg_type_name.typmods.is_empty() && !is_numeric_type_name(pg_type_name) {
                     return Err(ParseError::not_supported("a type modifier in a cast"));
                 }
                 if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
@@ -7898,7 +7898,7 @@ fn non_decimal_literal_as_decimal(literal: &str) -> Option<String> {
     Some(format!("{sign}{digits}"))
 }
 
-/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (smallint and oid to INTEGER; numeric and money to REAL; json, inet and uuid to TEXT), so the PostgreSQL type is gone before the cast is checked. A pg_type lookup and a typed expression tree that keeps the type replace this.
+/// FIXME(pg-catalog): This lowers PostgreSQL types to SQLite types in the parser (smallint and oid to INTEGER; money to REAL; json, inet and uuid to TEXT), so the PostgreSQL type is gone before the cast is checked. A pg_type lookup and a typed expression tree that keeps the type replace this.
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. A type that the frontend
 /// registers, such as boolean, keeps its name, and so do other names, so that
@@ -7913,11 +7913,10 @@ fn pg_type_name_to_ast_type(
         | "REGCLASS" | "REGTYPE" => "INTEGER",
         // Casts like INTEGER; the name types the result as int8.
         "BIGINT" | "INT8" | "BIGSERIAL" => "BIGINT",
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
-            "REAL"
-        }
+        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "MONEY" => "REAL",
         // The frontend registers these types, so the cast names the type
         // and converts the value as a column of the type does.
+        "NUMERIC" | "DECIMAL" => "numeric",
         "BOOLEAN" | "BOOL" => "boolean",
         "DATE" => "date",
         "TIME" => "time",
@@ -7930,12 +7929,38 @@ fn pg_type_name_to_ast_type(
         _ => &pg_type,
     };
 
+    let typmods = integer_typmods(type_name)?;
+    let size = if name == "numeric" {
+        match typmods.as_slice() {
+            [] => None,
+            [p] => Some(numeric_size(*p, 0)),
+            [p, s] => Some(numeric_size(*p, *s)),
+            _ => {
+                return Err(ParseError::not_supported(
+                    "numeric with three type modifiers",
+                ))
+            }
+        }
+    } else {
+        None
+    };
     let array_dimensions = type_name.array_bounds.len() as u32;
     check_array_dimensions(array_dimensions)?;
     Ok(ast::Type {
         name: name.to_string(),
-        size: None,
+        size,
         array_dimensions,
+    })
+}
+
+fn numeric_size(precision: i64, scale: i64) -> ast::TypeSize {
+    let literal = |n: i64| Box::new(ast::Expr::Literal(ast::Literal::Numeric(n.to_string())));
+    ast::TypeSize::TypeSize(literal(precision), literal(scale))
+}
+
+fn is_numeric_type_name(type_name: &pg_query::protobuf::TypeName) -> bool {
+    supported_type_name(type_name).is_ok_and(|name| {
+        name.eq_ignore_ascii_case("numeric") || name.eq_ignore_ascii_case("decimal")
     })
 }
 
@@ -8164,12 +8189,16 @@ fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, 
 fn extract_integer_typmods(
     col_def: &pg_query::protobuf::ColumnDef,
 ) -> Result<Vec<i64>, ParseError> {
+    match &col_def.type_name {
+        Some(type_name) => integer_typmods(type_name),
+        None => Ok(vec![]),
+    }
+}
+
+fn integer_typmods(type_name: &pg_query::protobuf::TypeName) -> Result<Vec<i64>, ParseError> {
     use pg_query::protobuf::a_const::Val;
     use pg_query::protobuf::node::Node;
 
-    let Some(type_name) = &col_def.type_name else {
-        return Ok(vec![]);
-    };
     type_name
         .typmods
         .iter()
@@ -14913,7 +14942,11 @@ mod tests {
 
     #[test]
     fn fail_closed_cast_type_modifiers() {
-        assert_not_supported("SELECT '1.239'::numeric(5, 2)", "a type modifier in a cast");
+        assert_translates("SELECT '1.239'::numeric(5, 2), '1.5'::decimal(5)");
+        assert_not_supported(
+            "SELECT '1.5'::numeric(1, 2, 3)",
+            "numeric with three type modifiers",
+        );
         assert_not_supported(
             "SELECT CAST('abcdef' AS varchar(3))",
             "a type modifier in a cast",

@@ -38,3 +38,52 @@ expect {
     1000
     2
 }
+
+test numeric-cast-keeps-exact-digits {
+    SELECT '123456789012345678901234567890.123'::numeric, '1e3'::numeric, '1.50'::numeric;
+}
+expect {
+    123456789012345678901234567890.123|1000|1.50
+}
+
+test numeric-cast-rounds-half-away-from-zero {
+    SELECT '1.005'::numeric(10,2), '2.675'::numeric(10,2), '-1.005'::numeric(10,2);
+}
+expect {
+    1.01|2.68|-1.01
+}
+
+test numeric-cast-without-scale-rounds-to-a-whole-number {
+    SELECT '2.5'::numeric(10), '3.5'::numeric(10,0);
+}
+expect {
+    3|4
+}
+
+test numeric-cast-rejects-a-value-with-too-many-digits {
+    SELECT '123456.1'::numeric(5,2);
+}
+@sqlstate 22003
+expect error {}
+
+test numeric-cast-rejects-text-that-is-not-a-number {
+    SELECT 'abc'::numeric;
+}
+@sqlstate 22P02
+expect error {}
+
+test numeric-addition-is-exact {
+    SELECT 0.1::numeric + 0.2::numeric;
+}
+expect {
+    0.3
+}
+
+test jsonb-casts-to-numeric {
+    CREATE TABLE j (f jsonb);
+    INSERT INTO j VALUES ('1.5');
+    SELECT f::numeric FROM j;
+}
+expect {
+    1.5
+}

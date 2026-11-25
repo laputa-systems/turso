@@ -90,18 +90,16 @@ fn gap_a_18_tursopg_returns_wrong_result_invalid_uuid_param_cast(db: TempDatabas
     assert_eq!(out, "nope");
 }
 
-// A-29 (S2): numeric $n param
-// tursopg: a numeric(p,s) cast of a param is not supported.
-// PostgreSQL: 12.35
+// A-29: numeric $n param rounds half away from zero
 #[turso_macros::test(views)]
-fn gap_a_29_tursopg_returns_wrong_result_numeric_n_param(db: TempDatabase) {
+fn gap_a_29_numeric_n_param(db: TempDatabase) {
     let out = GapCase {
         sql: "SELECT $1::numeric(10,2)",
         params: &[P::Text("12.345")],
         ..GapCase::default()
     }
     .run(db);
-    assert_eq!(out, "ERROR 0A000");
+    assert_eq!(out, "12.35");
 }
 
 // A-33: timestamptz $n param with offset
