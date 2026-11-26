@@ -4192,6 +4192,19 @@ impl Pager {
         Ok(())
     }
 
+    pub(crate) fn install_dirty_page(&self, page_id: u32, image: &[u8]) -> Result<()> {
+        turso_assert!(
+            self.rollback_journal.is_some(),
+            "only the rollback journal commits pages installed without their original"
+        );
+        let page = allocate_new_page(page_id as i64, &self.buffer_pool);
+        page.get_contents().as_ptr().copy_from_slice(image);
+        self.invalidate_all_cursors();
+        page.set_dirty();
+        self.dirty_pages.write().insert(page_id);
+        self.force_upsert_page_in_cache(page_id as usize, page)
+    }
+
     pub(crate) fn dirty_page_ids(&self) -> Vec<u32> {
         self.dirty_pages.read().iter().collect()
     }

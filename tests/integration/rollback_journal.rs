@@ -140,20 +140,29 @@ fn sqlite_view(db_path: &Path) -> SqliteView {
     }
 }
 
-fn rollback_journal_options() -> OpenOptions {
-    OpenOptions::new(Arc::new(SqliteDialect))
-        .flags(OpenFlags::Create)
-        .db_opts(DatabaseOpts::new().with_rollback_journal(true))
+fn rollback_journal_opts() -> DatabaseOpts {
+    DatabaseOpts::new().with_rollback_journal(true)
 }
 
-fn open_with_io(db_path: &Path, io: Arc<dyn IO>) -> (Arc<Database>, Arc<Connection>) {
-    let db = Database::open(io, db_path.to_str().unwrap(), rollback_journal_options()).unwrap();
+fn open_with(
+    db_path: &Path,
+    io: Arc<dyn IO>,
+    opts: DatabaseOpts,
+) -> (Arc<Database>, Arc<Connection>) {
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
+        .flags(OpenFlags::Create)
+        .db_opts(opts);
+    let db = Database::open(io, db_path.to_str().unwrap(), options).unwrap();
     let conn = db.connect(ConnectOpts::new(SessionRole::Superuser)).unwrap();
     (db, conn)
 }
 
 fn open(db_path: &Path) -> (Arc<Database>, Arc<Connection>) {
-    open_with_io(db_path, Arc::new(PlatformIO::new().unwrap()))
+    open_with(
+        db_path,
+        Arc::new(PlatformIO::new().unwrap()),
+        rollback_journal_opts(),
+    )
 }
 
 fn close(db: Arc<Database>, conn: Arc<Connection>) {
@@ -447,8 +456,14 @@ fn played_back_journal_is_finished_as_sqlite_finishes_it_in_each_locking_mode() 
     }
 }
 
+#[derive(Clone, Copy)]
+enum SnapshotPoint {
+    BeforeDatabaseWrite(usize),
+    AfterDatabaseTruncate,
+}
+
 struct Snapshot {
-    after_database_writes: usize,
+    point: SnapshotPoint,
     database_writes: usize,
     target: PathBuf,
     taken: bool,
@@ -469,9 +484,9 @@ impl SnapshotIo {
         }
     }
 
-    fn arm(&self, after_database_writes: usize, target: &Path) {
+    fn arm(&self, point: SnapshotPoint, target: &Path) {
         *self.snapshot.lock().unwrap() = Some(Snapshot {
-            after_database_writes,
+            point,
             database_writes: 0,
             target: target.to_path_buf(),
             taken: false,
@@ -540,13 +555,30 @@ impl SnapshotFile {
         let Some(snapshot) = snapshot.as_mut() else {
             return;
         };
-        if !snapshot.taken && snapshot.database_writes == snapshot.after_database_writes {
-            let db = snapshot.target.join("crash.db");
-            std::fs::copy(&self.db_path, &db).unwrap();
-            std::fs::copy(format!("{}-journal", self.db_path), sidecar(&db, "-journal")).unwrap();
-            snapshot.taken = true;
+        if matches!(snapshot.point, SnapshotPoint::BeforeDatabaseWrite(n) if n == snapshot.database_writes)
+        {
+            self.take(snapshot);
         }
         snapshot.database_writes += 1;
+    }
+
+    fn after_truncate(&self) {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        if let Some(snapshot) = snapshot.as_mut() {
+            if matches!(snapshot.point, SnapshotPoint::AfterDatabaseTruncate) {
+                self.take(snapshot);
+            }
+        }
+    }
+
+    fn take(&self, snapshot: &mut Snapshot) {
+        if snapshot.taken {
+            return;
+        }
+        let db = snapshot.target.join("crash.db");
+        std::fs::copy(&self.db_path, &db).unwrap();
+        std::fs::copy(format!("{}-journal", self.db_path), sidecar(&db, "-journal")).unwrap();
+        snapshot.taken = true;
     }
 }
 
@@ -587,7 +619,9 @@ impl File for SnapshotFile {
     }
 
     fn truncate(&self, len: u64, c: Completion) -> turso_core::Result<Completion> {
-        self.inner.truncate(len, c)
+        let completion = self.inner.truncate(len, c)?;
+        self.after_truncate();
+        Ok(completion)
     }
 }
 
@@ -608,7 +642,7 @@ fn sqlite_rolls_back_a_commit_interrupted_after_the_journal_sync() {
         let original_bytes = std::fs::read(&db_path).unwrap();
 
         let io = Arc::new(SnapshotIo::new(&db_path));
-        let (db, conn) = open_with_io(&db_path, io.clone());
+        let (db, conn) = open_with(&db_path, io.clone(), rollback_journal_opts());
         rows(&conn, "PRAGMA journal_mode=TRUNCATE");
         conn.execute(format!("PRAGMA synchronous={synchronous}")).unwrap();
         let snapshot_dir = dir.path().join(format!("snapshot-{round}"));
@@ -624,7 +658,10 @@ fn sqlite_rolls_back_a_commit_interrupted_after_the_journal_sync() {
             .unwrap();
         }
         conn.execute("DELETE FROM users WHERE id % 4 = 1").unwrap();
-        io.arm(after_database_writes, &snapshot_dir);
+        io.arm(
+            SnapshotPoint::BeforeDatabaseWrite(after_database_writes),
+            &snapshot_dir,
+        );
         conn.execute("COMMIT").unwrap();
         assert!(io.taken(), "{synchronous}: the commit wrote the database file");
         let committed = turso_dump(&conn);
@@ -662,6 +699,46 @@ fn sqlite_rolls_back_a_commit_interrupted_after_the_journal_sync() {
         assert_eq!(after_commit.dump, committed, "{synchronous}");
         assert_eq!(std::fs::metadata(sidecar(&db_path, "-journal")).unwrap().len(), 0);
     }
+}
+
+#[test]
+fn vacuum_shrinks_the_database_through_the_journal() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("history.db");
+    python(
+        "con = sqlite3.connect(sys.argv[1], isolation_level=None)\npopulate(con)\ncon.execute('DELETE FROM visits WHERE id % 4 != 0')\ncon.close()\n",
+        &[&db_path],
+    );
+    let before = sqlite_view(&db_path);
+    let original_size = std::fs::metadata(&db_path).unwrap().len();
+
+    let io = Arc::new(SnapshotIo::new(&db_path));
+    let (db, conn) = open_with(&db_path, io.clone(), rollback_journal_opts().with_vacuum(true));
+    rows(&conn, "PRAGMA journal_mode=TRUNCATE");
+    let snapshot_dir = dir.path().join("snapshot");
+    std::fs::create_dir(&snapshot_dir).unwrap();
+    io.arm(SnapshotPoint::AfterDatabaseTruncate, &snapshot_dir);
+    conn.execute("VACUUM").unwrap();
+    assert!(io.taken(), "VACUUM truncated the database file");
+    let pages = single(&conn, "PRAGMA page_count");
+    assert_eq!(turso_dump(&conn), before.dump);
+    close(db, conn);
+
+    let vacuumed_size = std::fs::metadata(&db_path).unwrap().len();
+    assert!(vacuumed_size < original_size);
+    assert_eq!(pages, format!("i:{}", vacuumed_size / 4096));
+    assert_eq!(header_versions(&db_path), (1, 1));
+    assert_eq!(std::fs::metadata(sidecar(&db_path, "-journal")).unwrap().len(), 0);
+    let after = sqlite_view(&db_path);
+    assert_eq!(after.integrity, "ok");
+    assert_eq!(after.dump, before.dump);
+
+    let crash_db = snapshot_dir.join("crash.db");
+    assert_eq!(std::fs::metadata(&crash_db).unwrap().len(), vacuumed_size);
+    let recovered = sqlite_view(&crash_db);
+    assert_eq!(recovered.integrity, "ok");
+    assert_eq!(recovered.dump, before.dump);
+    assert_eq!(std::fs::metadata(&crash_db).unwrap().len(), original_size);
 }
 
 #[test]

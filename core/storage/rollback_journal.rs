@@ -326,7 +326,18 @@ impl RollbackJournal {
             if dirty.is_empty() {
                 return Ok(IOResult::Done(()));
             }
+            let page_size = pager.get_page_size_unchecked().get() as u64;
+            let file_pages = u32::try_from(pager.db_file.size()?.div_ceil(page_size))
+                .map_err(|_| LimboError::Corrupt("database file is too large".into()))?;
             let header = crate::return_if_io!(pager.with_header_mut(|header| {
+                // SQLite trusts the in-header database size only when
+                // version-valid-for matches the change counter, and uses the
+                // file size otherwise.
+                if header.version_valid_for.get() != header.change_counter.get()
+                    || header.database_size.get() == 0
+                {
+                    header.database_size = header.database_size.get().max(file_pages).into();
+                }
                 let change_counter = header.change_counter.get().wrapping_add(1);
                 header.change_counter = change_counter.into();
                 header.version_valid_for = change_counter.into();
@@ -389,6 +400,7 @@ enum CommitStep {
     WriteRecordCount,
     SyncJournalHeader,
     WriteDatabase,
+    TruncateDatabase,
     SyncDatabase,
     FinalizeJournal,
     SyncFinalizedJournal,
@@ -403,6 +415,7 @@ struct JournalCommit {
     sync_type: FileSyncType,
     page_size: usize,
     original_pages: u32,
+    truncated_size: Option<u32>,
     nonce: u32,
     journaled: Vec<(u32, Arc<Buffer>)>,
     dirty: Vec<PageRef>,
@@ -443,6 +456,19 @@ impl JournalCommit {
             }
             dirty.push(page);
         }
+        let truncated_size = (new_database_pages < original_pages).then_some(new_database_pages);
+        if truncated_size.is_some() {
+            // A playback first restores the original size, so every page
+            // that the truncation cuts off must be in the journal too. The
+            // page holding the pending byte is never used, and SQLite stops
+            // a playback at a record for it.
+            let pending_byte_page = Pager::get_pending_byte() / page_size as u32 + 1;
+            for page_id in new_database_pages + 1..=original_pages {
+                if page_id != pending_byte_page {
+                    journaled.push((page_id, Arc::new(Buffer::new_temporary(page_size))));
+                }
+            }
+        }
         Ok(Self {
             step: CommitStep::ReadOriginals,
             pending: None,
@@ -451,6 +477,7 @@ impl JournalCommit {
             sync_type: pager.get_sync_type(),
             page_size,
             original_pages,
+            truncated_size,
             nonce: pager.io.generate_random_number() as u32,
             journaled,
             dirty,
@@ -488,6 +515,13 @@ impl JournalCommit {
                     shared.needs_playback.store(true, Ordering::Release);
                     Some(self.write_database(pager)?)
                 }
+                CommitStep::TruncateDatabase => match self.truncated_size {
+                    Some(pages) => Some(pager.db_file.truncate(
+                        pages as usize * self.page_size,
+                        Completion::new_trunc(|_| {}),
+                    )?),
+                    None => None,
+                },
                 CommitStep::SyncDatabase if self.sync_mode != SyncMode::Off => Some(
                     pager
                         .db_file
@@ -676,7 +710,8 @@ fn next_step(step: CommitStep) -> CommitStep {
         CommitStep::SyncJournalRecords => CommitStep::WriteRecordCount,
         CommitStep::WriteRecordCount => CommitStep::SyncJournalHeader,
         CommitStep::SyncJournalHeader => CommitStep::WriteDatabase,
-        CommitStep::WriteDatabase => CommitStep::SyncDatabase,
+        CommitStep::WriteDatabase => CommitStep::TruncateDatabase,
+        CommitStep::TruncateDatabase => CommitStep::SyncDatabase,
         CommitStep::SyncDatabase => CommitStep::FinalizeJournal,
         CommitStep::FinalizeJournal => CommitStep::SyncFinalizedJournal,
         CommitStep::SyncFinalizedJournal | CommitStep::Done => CommitStep::Done,

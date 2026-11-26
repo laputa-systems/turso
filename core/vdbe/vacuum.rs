@@ -1528,6 +1528,15 @@ enum VacuumInPlacePhase {
     /// Install the pre-captured replacement metadata (from `CaptureTargetMetadata`)
     /// after the source image is committed, regardless of whether the final checkpoint succeeded.
     InstallCommittedImage,
+    CopyTempBatchToCache {
+        total_pages: u32,
+        next_page: u32,
+        source_change_counter: u32,
+        read_scratch_buf: Arc<Buffer>,
+        batch_pages: Vec<PageRef>,
+        read_completion: Completion,
+    },
+    CommitRollbackJournal,
     /// Clean up after successful commit.
     Done,
 }
@@ -1943,6 +1952,10 @@ fn vacuum_in_place_step(
                     .into());
                 }
                 reject_unsupported_vacuum_auto_vacuum_mode(source_pager.get_auto_vacuum_mode())?;
+                if source_pager.rollback_journal().is_some() {
+                    *phase = VacuumInPlacePhase::BeginSourceTx;
+                    continue;
+                }
                 // 6. Reject non-WAL pagers.
                 let wal = source_pager.wal.as_ref().ok_or_else(|| {
                     LimboError::InternalError("VACUUM requires a WAL-mode database".to_string())
@@ -2000,6 +2013,24 @@ fn vacuum_in_place_step(
                 continue;
             }
 
+            VacuumInPlacePhase::BeginSourceTx if source_pager.rollback_journal().is_some() => {
+                if !source_pager.holds_read_lock() {
+                    source_pager.begin_read_tx()?;
+                }
+                if let IOResult::IO(io) =
+                    source_pager.begin_write_tx(crate::storage::wal::WalAutoActions::empty())?
+                {
+                    return Ok(IOResult::IO(io));
+                }
+                connection.auto_commit.store(false, Ordering::SeqCst);
+                connection.set_tx_state(crate::connection::TransactionState::Write {
+                    schema_did_change: false,
+                });
+                cleanup_state.source_tx_open = true;
+                *phase = VacuumInPlacePhase::ReadSourceMetadata;
+                continue;
+            }
+
             VacuumInPlacePhase::BeginSourceTx => {
                 // Acquire exclusive WAL access in one shot:
                 // vacuum lock + WAL write lock + connection snapshot.
@@ -2027,7 +2058,8 @@ fn vacuum_in_place_step(
 
             VacuumInPlacePhase::ReadSourceMetadata => {
                 turso_assert!(
-                    cleanup_state.checkpoint_cleanup == CheckpointLockCleanup::ReleaseRaw,
+                    cleanup_state.checkpoint_cleanup == CheckpointLockCleanup::ReleaseRaw
+                        || source_pager.rollback_journal().is_some(),
                     "VACUUM source metadata phase requires held checkpoint lock"
                 );
                 turso_assert!(
@@ -2139,15 +2171,31 @@ fn vacuum_in_place_step(
                 let io = &*temp_pager.io;
                 let total_pages: u32 =
                     io.block(|| temp_pager.with_header(|h| h.database_size.get()))?;
-                let wal = source_pager
-                    .wal
-                    .as_ref()
-                    .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
-
                 turso_assert!(
                     total_pages > 0,
                     "VACUUM target build must produce at least page 1 in the committed temp image"
                 );
+                if source_pager.rollback_journal().is_some() {
+                    let source_change_counter =
+                        io.block(|| source_pager.with_header(|h| h.change_counter.get()))?;
+                    let batch_end = next_vacuum_copy_batch_start(1, total_pages);
+                    let read_scratch_buf = new_vacuum_read_scratch_buf(&temp_pager);
+                    let (batch_pages, read_completion) =
+                        start_temp_batch_reads(&temp_pager, 1, batch_end, &read_scratch_buf)?;
+                    *phase = VacuumInPlacePhase::CopyTempBatchToCache {
+                        total_pages,
+                        next_page: batch_end,
+                        source_change_counter,
+                        read_scratch_buf,
+                        batch_pages,
+                        read_completion,
+                    };
+                    continue;
+                }
+                let wal = source_pager
+                    .wal
+                    .as_ref()
+                    .ok_or_else(|| LimboError::InternalError("VACUUM requires WAL".into()))?;
 
                 // Initialize the source WAL header before the first batch.
                 let page_sz = source_pager.get_page_size_unchecked();
@@ -2510,6 +2558,72 @@ fn vacuum_in_place_step(
                         return Err(err);
                     }
                 }
+            }
+
+            VacuumInPlacePhase::CopyTempBatchToCache {
+                total_pages,
+                next_page,
+                source_change_counter,
+                read_scratch_buf,
+                batch_pages,
+                read_completion,
+            } => {
+                if !read_completion.finished() {
+                    return Ok(IOResult::IO(IOCompletions(read_completion.clone())));
+                }
+                if !read_completion.succeeded() {
+                    return Err(vacuum_completion_error(read_completion, "temp batch read").into());
+                }
+                for page in batch_pages.iter() {
+                    source_pager
+                        .install_dirty_page(page.get().id() as u32, page.get_contents().as_ptr())?;
+                }
+                if *next_page <= *total_pages {
+                    let temp_pager = temp_db
+                        .as_ref()
+                        .expect("VACUUM copy phase requires temp db")
+                        .conn
+                        .get_pager();
+                    let batch_end = next_vacuum_copy_batch_start(*next_page, *total_pages);
+                    let (pages, completion) = start_temp_batch_reads(
+                        &temp_pager,
+                        *next_page,
+                        batch_end,
+                        read_scratch_buf,
+                    )?;
+                    *next_page = batch_end;
+                    *batch_pages = pages;
+                    *read_completion = completion;
+                    continue;
+                }
+                let source_change_counter = *source_change_counter;
+                source_pager.io.block(|| {
+                    source_pager.with_header_mut(|header| {
+                        header.change_counter = source_change_counter.into();
+                        header.version_valid_for = source_change_counter.into();
+                    })
+                })?;
+                *phase = VacuumInPlacePhase::CommitRollbackJournal;
+                continue;
+            }
+
+            VacuumInPlacePhase::CommitRollbackJournal => {
+                let sync_mode = connection.get_sync_mode_for_database(db)?;
+                if let IOResult::IO(io) = source_pager.commit_tx(connection, sync_mode, true)? {
+                    return Ok(IOResult::IO(io));
+                }
+                cleanup_state.source_tx_open = false;
+                connection.auto_commit.store(true, Ordering::SeqCst);
+                connection.set_tx_state(crate::connection::TransactionState::None);
+                source_pager.clear_page_cache(false);
+                source_pager.set_schema_cookie(None);
+                drop(
+                    temp_db
+                        .take()
+                        .expect("VACUUM rollback journal commit requires temp db"),
+                );
+                *phase = VacuumInPlacePhase::InstallCommittedImage;
+                continue;
             }
 
             VacuumInPlacePhase::InstallCommittedImage => {
