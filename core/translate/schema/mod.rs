@@ -1714,7 +1714,8 @@ pub const SQLITE_TABLEID: &str = "sqlite_schema";
 /// SQLite numbers the indexes of the constraints in definition order. An
 /// INTEGER PRIMARY KEY is the rowid and gets neither an index nor a number.
 /// The PRIMARY KEY of a WITHOUT ROWID table is the table b-tree, so it gets
-/// no index of its own, but it takes its number.
+/// no index of its own, but it takes its number, which is the last one when
+/// SQLite makes its index last.
 fn collect_autoindexes(
     table: &BTreeTable,
     program: &mut ProgramBuilder,
@@ -1723,7 +1724,9 @@ fn collect_autoindexes(
     let mut number = 0;
     for us in table.unique_sets.iter() {
         if table.is_without_rowid_primary_key(us) {
-            number += 1;
+            if !table.without_rowid_primary_key_is_made_last() {
+                number += 1;
+            }
             continue;
         }
         if us.is_primary_key && us.columns.len() == 1 {

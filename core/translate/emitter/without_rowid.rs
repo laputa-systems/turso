@@ -469,17 +469,10 @@ pub(crate) fn constraint_check_rank(
     index: Option<&Index>,
 ) -> (bool, Option<Reverse<usize>>) {
     match index {
-        None => {
-            let number = table
-                .unique_sets
-                .iter()
-                .position(|unique_set| table.is_without_rowid_primary_key(unique_set))
-                .map_or(0, |position| position + 1);
-            (
-                table.rowid_alias_conflict_clause == Some(ResolveType::Replace),
-                Some(Reverse(number)),
-            )
-        }
+        None => (
+            table.rowid_alias_conflict_clause == Some(ResolveType::Replace),
+            Some(Reverse(table.without_rowid_primary_key_number())),
+        ),
         Some(index) => {
             let number = index
                 .name

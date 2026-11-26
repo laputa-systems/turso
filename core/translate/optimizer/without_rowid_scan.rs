@@ -4,13 +4,15 @@
 //! ROWID table, the PRIMARY KEY index that is the table among them. A scan of
 //! an index that holds every column the query reads costs
 //! `rSize + 1 + 15*szIdxRow/szTabRow`, so the narrowest such index wins, and
-//! of equally narrow ones, the first in the table's list of indexes. Rows come
-//! out in the order of that index, which a SELECT without ORDER BY shows.
+//! of equally narrow ones, the first in the table's list of indexes. A scan
+//! of another index also pays for a lookup of each row. Rows come out in the
+//! order of the index, which a SELECT without ORDER BY shows.
 
 use crate::schema::{BTreeTable, Column, Index};
 use crate::sync::Arc;
 use crate::translate::emitter::without_rowid::constraint_check_rank;
 use crate::translate::plan::JoinedTable;
+use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 
 /// The index of `table` that SQLite scans when the query reads the table in
 /// full, of the table b-tree, for None, and the indexes of `candidates`.
@@ -43,7 +45,7 @@ pub(crate) fn full_scan_index<'a>(
         scans.push((cost(width, false), None));
     }
     for index in candidates {
-        if index.index_method.is_some() || !joined_table.index_is_covering(index) {
+        if index.index_method.is_some() {
             continue;
         }
         let width = index
@@ -54,7 +56,14 @@ pub(crate) fn full_scan_index<'a>(
                 None => column_size_estimate(&table.columns()[column.pos_in_table]),
             })
             .sum();
-        scans.push((cost(width, index.where_clause.is_some()), Some(index)));
+        let partial = index.where_clause.is_some();
+        let scan_cost = if covers(joined_table, index) {
+            cost(width, partial)
+        } else {
+            let rows: i64 = if partial { 190 } else { 200 };
+            log_est_add(cost(width, partial), rows + 16)
+        };
+        scans.push((scan_cost, Some(index)));
     }
     scans.sort_by_key(|(_, index)| constraint_check_rank(table, index.map(Arc::as_ref)));
     let (_, index) = scans
@@ -63,6 +72,22 @@ pub(crate) fn full_scan_index<'a>(
         .copied()
         .unwrap_or((0, None));
     index.cloned()
+}
+
+/// Whether SQLite reads the columns that the query uses from `index` alone.
+/// SQLite records which columns the index of a UNIQUE constraint holds
+/// before convertToWithoutRowidTable appends the PRIMARY KEY to it, so only
+/// the declared key of such an index counts.
+fn covers(joined_table: &JoinedTable, index: &Index) -> bool {
+    if !index.name.starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX) {
+        return joined_table.index_is_covering(index);
+    }
+    joined_table.col_used_mask.iter().all(|position| {
+        index
+            .key_columns()
+            .iter()
+            .any(|column| column.expression().is_none() && column.pos_in_table == position)
+    })
 }
 
 /// SQLite's estimate of the size of a value of `column`, in units of 4 bytes,
@@ -161,4 +186,21 @@ fn log_est(mut x: u64) -> i64 {
         x >>= shift;
     }
     FRACTIONS[(x & 7) as usize] + y - 10
+}
+
+/// SQLite's sqlite3LogEstAdd: the estimate of the sum of the values that `a`
+/// and `b` estimate.
+fn log_est_add(a: i64, b: i64) -> i64 {
+    const EXTRA: [i64; 32] = [
+        10, 10, 9, 9, 8, 8, 7, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2,
+        2, 2, 2,
+    ];
+    let (high, low) = if a >= b { (a, b) } else { (b, a) };
+    if high > low + 49 {
+        return high;
+    }
+    if high > low + 31 {
+        return high + 1;
+    }
+    high + EXTRA[(high - low) as usize]
 }

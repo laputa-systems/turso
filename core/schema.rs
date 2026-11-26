@@ -6127,9 +6127,9 @@ impl BTreeTable {
             && index
                 .name
                 .starts_with(crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
-            && index.columns.len() == self.primary_key_columns.len()
+            && index.key_columns().len() == self.primary_key_columns.len()
             && index
-                .columns
+                .key_columns()
                 .iter()
                 .zip(&self.primary_key_columns)
                 .all(|(index_col, (pk_col, _))| index_col.name.eq_ignore_ascii_case(pk_col))
@@ -6508,6 +6508,42 @@ impl BTreeTable {
                         .iter()
                         .zip(&self.primary_key_columns)
                         .all(|(column, (pk_name, _))| column.name.eq_ignore_ascii_case(pk_name))))
+    }
+
+    /// The number that ends the name SQLite gives the PRIMARY KEY index of a
+    /// WITHOUT ROWID table: its place among the PRIMARY KEY and UNIQUE
+    /// constraints.
+    pub fn without_rowid_primary_key_number(&self) -> usize {
+        if self.without_rowid_primary_key_is_made_last() {
+            let other_sets = self
+                .unique_sets
+                .iter()
+                .filter(|unique_set| !self.is_without_rowid_primary_key(unique_set))
+                .count();
+            return other_sets + 1;
+        }
+        self.unique_sets
+            .iter()
+            .position(|unique_set| self.is_without_rowid_primary_key(unique_set))
+            .map_or(1, |position| position + 1)
+    }
+
+    /// Whether SQLite makes the PRIMARY KEY index of this WITHOUT ROWID table
+    /// after the indexes of all its UNIQUE constraints. sqlite3AddPrimaryKey
+    /// takes a PRIMARY KEY of one column of type INTEGER for the rowid, unless
+    /// the column constraint says DESC, and convertToWithoutRowidTable makes
+    /// its index at the end.
+    pub fn without_rowid_primary_key_is_made_last(&self) -> bool {
+        let [(name, order)] = self.primary_key_columns.as_slice() else {
+            return false;
+        };
+        let Some((_, column)) = self.get_column(name) else {
+            return false;
+        };
+        !self.has_rowid
+            && column.ty_str.eq_ignore_ascii_case("INTEGER")
+            && column.ty_params.is_empty()
+            && !(self.primary_key_is_inline && *order == SortOrder::Desc)
     }
 
     /// The collation of PRIMARY KEY column `column_name`, which is `column`:

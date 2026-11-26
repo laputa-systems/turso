@@ -22,6 +22,7 @@ use crate::storage::pager::Pager;
 use crate::storage::rollback_journal::LockingMode;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
+use crate::translate::emitter::without_rowid::constraint_check_rank;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
 use crate::util::{
@@ -1183,7 +1184,7 @@ fn query_pragma(
                         index_namespace.id,
                         &index_name,
                     )? {
-                        for (seqno, col) in index.columns.iter().enumerate() {
+                        for (seqno, col) in index.key_columns().iter().enumerate() {
                             program.emit_int(seqno as i64, base_reg);
                             emit_index_column_cid_and_name(program, col, base_reg + 1);
                             program.emit_result_row(base_reg, 3);
@@ -1230,7 +1231,8 @@ fn query_pragma(
                             emit_index_column_cid_and_name(program, col, base_reg + 1);
                             program.emit_int(desc as i64, base_reg + 3);
                             program.emit_string8(coll, base_reg + 4);
-                            program.emit_int(1, base_reg + 5); // key column
+                            let is_key = seqno < index.key_columns().len();
+                            program.emit_int(i64::from(is_key), base_reg + 5);
                             program.emit_result_row(base_reg, 6);
                         }
 
@@ -1302,11 +1304,20 @@ fn query_pragma(
                             None => None,
                         };
 
-                        let indices = schema
+                        let mut indices: Vec<&Index> = schema
                             .get_indices(table_namespace.id, &table_name)
                             .map(|index| index.as_ref())
-                            .chain(without_rowid_pk_index.as_ref());
-                        for (seq, index) in indices.enumerate() {
+                            .collect();
+                        if let (Some(bt), Some(pk_index)) = (&btree, &without_rowid_pk_index) {
+                            indices.push(pk_index);
+                            indices.sort_by_key(|index| {
+                                constraint_check_rank(
+                                    bt,
+                                    (!std::ptr::eq(*index, pk_index)).then_some(*index),
+                                )
+                            });
+                        }
+                        for (seq, index) in indices.into_iter().enumerate() {
                             let origin = if btree
                                 .as_ref()
                                 .is_some_and(|bt| bt.is_primary_key_index(index))
@@ -1988,13 +1999,21 @@ fn find_index_by_name(
     {
         return Ok(Some(index.clone()));
     }
-    let Some(table) = index_name
+    let Some((table, number)) = index_name
         .strip_prefix(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
-        .and_then(|rest| rest.strip_suffix("_1"))
-        .and_then(|table_name| schema.get_btree_table(namespace, table_name))
+        .and_then(|rest| rest.rsplit_once('_'))
+        .and_then(|(table_name, number)| {
+            Some((
+                schema.get_btree_table(namespace, table_name)?,
+                number.parse::<usize>().ok()?,
+            ))
+        })
     else {
         return Ok(None);
     };
+    if table.has_rowid || number != table.without_rowid_primary_key_number() {
+        return Ok(None);
+    }
     Ok(without_rowid_primary_key_index(&table)?.map(Arc::new))
 }
 
@@ -2006,7 +2025,11 @@ fn without_rowid_primary_key_index(table: &BTreeTable) -> Result<Option<Index>> 
     let index = Index::automatic_from_primary_key(
         table,
         (
-            format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_1", table.name),
+            format!(
+                "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
+                table.name,
+                table.without_rowid_primary_key_number()
+            ),
             table.root_page,
         ),
         table.primary_key_columns.len(),
