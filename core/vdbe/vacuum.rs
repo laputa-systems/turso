@@ -1195,6 +1195,18 @@ pub(crate) fn vacuum_target_build_step(
                 // Commit the target transaction started in Init phase.
                 state.target_conn.execute("COMMIT")?;
                 state.target_conn.publish_schema_if_newer();
+                // SQLite's VACUUM copies triggers, views and rootpage = 0
+                // rows into the new sqlite_schema with an ordinary INSERT on the
+                // vacuuming connection, so its last insert rowid becomes the
+                // rowid of the last copied row.
+                if !state.post_data_entries.is_empty() {
+                    let mut rowid_stmt =
+                        state.target_conn.prepare_internal("SELECT max(rowid) FROM sqlite_schema")?;
+                    let rows = rowid_stmt.run_collect_rows()?;
+                    if let Some(rowid) = rows.first().and_then(|row| row.first()).and_then(|value| value.as_int()) {
+                        config.source_conn.update_last_rowid(rowid);
+                    }
+                }
                 return Ok(crate::IOResult::Done(()));
             }
         }
