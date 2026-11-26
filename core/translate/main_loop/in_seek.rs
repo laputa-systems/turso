@@ -65,7 +65,7 @@ pub(super) fn emit_in_seek_start(
             target_pc: next_value,
         });
         if let Some(table_cursor_id) = table_cursor_id {
-            program.emit_deferred_seek(index_cursor_id, table_cursor_id);
+            program.emit_index_to_table_seek(index_cursor_id, table_cursor_id, next_value);
         }
     }
 

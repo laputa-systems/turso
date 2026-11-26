@@ -92,6 +92,7 @@ pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
 pub(crate) mod unnest;
+mod without_rowid_scan;
 
 #[derive(Debug, Default)]
 pub(crate) struct AvailableIndexes {
@@ -104,7 +105,6 @@ impl AvailableIndexes {
             .joined_tables()
             .iter()
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
-            .filter(|jt| jt.btree().is_none_or(|btree| btree.has_rowid))
             .filter_map(|jt| {
                 let indexes: VecDeque<_> =
                     resolver.with_schema(jt.namespace.database_id, |schema| {
@@ -2649,12 +2649,6 @@ fn enforce_indexed_by_hints(
         match indexed {
             ast::Indexed::IndexedBy(name) => {
                 let idx_name = name.as_str();
-                if table_ref.btree().is_some_and(|btree| !btree.has_rowid) {
-                    crate::bail_parse_error!(
-                        "INDEXED BY is not supported on WITHOUT ROWID tables: {}",
-                        idx_name
-                    );
-                }
                 // Verify the index exists and belongs to this table.
                 let forced_index =
                     available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);

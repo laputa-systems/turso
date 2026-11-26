@@ -493,6 +493,20 @@ pub(super) fn choose_best_btree_candidate(
     if !has_valid_candidate {
         return Ok(None);
     }
+    if let Some(table) = rhs_table.btree().filter(|table| !table.has_rowid) {
+        if best_choice.constraint_refs.is_empty() && !best_is_ordered {
+            best_choice.index = super::without_rowid_scan::full_scan_index(
+                rhs_table,
+                &table,
+                has_rowid_candidate,
+                rhs_constraints
+                    .candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.index.as_ref()),
+            );
+            best_choice.iter_dir = IterationDirection::Forwards;
+        }
+    }
     Ok(Some(best_choice))
 }
 

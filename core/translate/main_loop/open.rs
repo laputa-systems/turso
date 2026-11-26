@@ -514,7 +514,7 @@ pub(super) fn emit_table_read_start(
             }
             if let Some(table_cursor_id) = table_cursor_id {
                 if let Some(index_cursor_id) = index_cursor_id {
-                    program.emit_deferred_seek(index_cursor_id, table_cursor_id);
+                    program.emit_index_to_table_seek(index_cursor_id, table_cursor_id, next);
                 }
             }
         }
@@ -663,7 +663,11 @@ pub(super) fn emit_table_read_start(
                         if let Some(index_cursor_id) = index_cursor_id {
                             if let Some(table_cursor_id) = table_cursor_id {
                                 // Don't do a btree table seek until it's actually necessary to read from the table.
-                                program.emit_deferred_seek(index_cursor_id, table_cursor_id);
+                                program.emit_index_to_table_seek(
+                                    index_cursor_id,
+                                    table_cursor_id,
+                                    next,
+                                );
                             }
                         }
                     }

@@ -1573,6 +1573,58 @@ impl ProgramBuilder {
     }
 
     /// Emit a deferred table seek when the index can identify a table row.
+    /// Positions `table_cursor_id` on the row of the entry under
+    /// `index_cursor_id`. The seek of an index with rowids waits until a
+    /// column of the row is read. An entry of an index of a WITHOUT ROWID
+    /// table ends with the primary key of its row, which SQLite reads from the
+    /// entry to find the row at once, going to `not_found` when the table has
+    /// no such row.
+    pub fn emit_index_to_table_seek(
+        &mut self,
+        index_cursor_id: CursorID,
+        table_cursor_id: CursorID,
+        not_found: BranchOffset,
+    ) {
+        let primary_key_columns = match (
+            self.get_cursor_type(index_cursor_id),
+            self.get_cursor_type(table_cursor_id),
+        ) {
+            (Some(CursorType::BTreeIndex(index)), Some(CursorType::BTreeTable(table)))
+                if !index.has_rowid && !table.has_rowid =>
+            {
+                table
+                    .primary_key_columns
+                    .iter()
+                    .map(|(pk_name, _)| {
+                        table.get_column(pk_name).and_then(|(position, _)| {
+                            index.column_table_pos_to_index_pos(position)
+                        })
+                    })
+                    .collect::<Option<Vec<usize>>>()
+            }
+            _ => None,
+        };
+        let Some(primary_key_columns) = primary_key_columns else {
+            self.emit_deferred_seek(index_cursor_id, table_cursor_id);
+            return;
+        };
+        let key_reg = self.alloc_registers(primary_key_columns.len());
+        for (offset, column) in primary_key_columns.iter().enumerate() {
+            self.emit_insn(Insn::Column {
+                cursor_id: index_cursor_id,
+                column: *column,
+                dest: key_reg + offset,
+                default: None,
+            });
+        }
+        self.emit_insn(Insn::NotFound {
+            cursor_id: table_cursor_id,
+            target_pc: not_found,
+            record_reg: key_reg,
+            num_regs: primary_key_columns.len(),
+        });
+    }
+
     pub fn emit_deferred_seek(&mut self, index_cursor_id: CursorID, table_cursor_id: CursorID) {
         let cursor_type = self.get_cursor_type(index_cursor_id);
         // A rowid-free index cannot identify a base-table row. Such a plan must
