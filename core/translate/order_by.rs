@@ -182,6 +182,7 @@ impl EmitOrderBy {
                 index_method: None,
                 on_conflict: None,
                 constraint_name: None,
+                pk_suffix_len: 0,
             });
             program.alloc_cursor_id(CursorType::BTreeIndex(index))
         } else {

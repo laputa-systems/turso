@@ -791,11 +791,6 @@ fn validate(
                 if table.primary_key_columns.is_empty() {
                     bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
                 }
-                if table.unique_sets.iter().any(|us| !us.is_primary_key) {
-                    bail_parse_error!(
-                        "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
-                    );
-                }
             } else if table.has_autoincrement {
                 // SQLite allows AUTOINCREMENT only on a key declared exactly as
                 // INTEGER PRIMARY KEY: quotes around INTEGER are allowed, a size
@@ -1465,25 +1460,20 @@ pub fn translate_create_table(
         }
     }
 
-    if let Some(index_regs) = index_regs.as_ref() {
-        for index_reg in index_regs.iter() {
-            program.emit_insn(Insn::CreateBtree {
-                db: database_id,
-                root: *index_reg,
-                flags: CreateBTreeFlags::new_index(),
-            });
-        }
+    for (_, index_reg) in &index_regs {
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: *index_reg,
+            flags: CreateBTreeFlags::new_index(),
+        });
     }
 
     let automatic_indexes: Vec<AutomaticIndex> = index_regs
         .into_iter()
-        .flatten()
-        .enumerate()
-        .map(|(idx, root_reg)| AutomaticIndex {
+        .map(|(number, root_reg)| AutomaticIndex {
             name: format!(
                 "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_{}",
-                mangled_tbl_name,
-                idx + 1
+                mangled_tbl_name, number
             ),
             root_reg,
         })
@@ -1717,54 +1707,38 @@ pub fn translate_drop_schema(
 
 pub const SQLITE_TABLEID: &str = "sqlite_schema";
 
-/// Check if an automatic PRIMARY KEY index is required for the table.
-/// If so, create a register for the index root page and return it.
+/// The automatic indexes that the PRIMARY KEY and UNIQUE constraints of a new
+/// table need: for each, the number SQLite ends its name with and a register
+/// for its root page.
 ///
-/// An automatic PRIMARY KEY index is not required if:
-/// - The table has no PRIMARY KEY
-/// - The table has a single-column PRIMARY KEY whose typename is _exactly_ "INTEGER" e.g. not "INT".
-///   In this case, the PRIMARY KEY column becomes an alias for the rowid.
-///
-/// Otherwise, an automatic PRIMARY KEY index is required.
+/// SQLite numbers the indexes of the constraints in definition order. An
+/// INTEGER PRIMARY KEY is the rowid and gets neither an index nor a number.
+/// The PRIMARY KEY of a WITHOUT ROWID table is the table b-tree, so it gets
+/// no index of its own, but it takes its number.
 fn collect_autoindexes(
     table: &BTreeTable,
     program: &mut ProgramBuilder,
-) -> Result<Option<Vec<usize>>> {
-    let mut regs: Vec<usize> = Vec::new();
-
-    // include UNIQUE singles, include PK single only if not rowid alias
-    for us in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
-        if us.is_primary_key && !table.has_rowid {
+) -> Result<Vec<(usize, usize)>> {
+    let mut indexes = Vec::new();
+    let mut number = 0;
+    for us in table.unique_sets.iter() {
+        if table.is_without_rowid_primary_key(us) {
+            number += 1;
             continue;
         }
-        let col_name = &us.columns.first().unwrap().name;
-        let Some((_pos, col)) = table.get_column(col_name) else {
-            bail_parse_error!("Column {col_name} not found in table {}", table.name);
-        };
-
-        let needs_index = if us.is_primary_key {
-            !(col.primary_key() && col.is_rowid_alias())
-        } else {
-            // UNIQUE single needs an index
-            true
-        };
-
-        if needs_index {
-            regs.push(program.alloc_register());
+        if us.is_primary_key && us.columns.len() == 1 {
+            let col_name = &us.columns.first().unwrap().name;
+            let Some((_pos, col)) = table.get_column(col_name) else {
+                bail_parse_error!("Column {col_name} not found in table {}", table.name);
+            };
+            if col.primary_key() && col.is_rowid_alias() {
+                continue;
+            }
         }
+        number += 1;
+        indexes.push((number, program.alloc_register()));
     }
-
-    for _us in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
-        if !table.has_rowid && _us.is_primary_key {
-            continue;
-        }
-        regs.push(program.alloc_register());
-    }
-    if regs.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(regs))
-    }
+    Ok(indexes)
 }
 
 fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImpl>) -> String {

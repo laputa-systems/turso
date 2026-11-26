@@ -1553,6 +1553,7 @@ mod tests {
                 index_method: None,
                 on_conflict: None,
                 constraint_name: None,
+                pk_suffix_len: 0,
             })]),
         );
 
@@ -1704,6 +1705,7 @@ mod tests {
                 index_method: None,
                 on_conflict: None,
                 constraint_name: None,
+                pk_suffix_len: 0,
             })]),
         );
 
@@ -1816,6 +1818,7 @@ mod tests {
                 index_method: None,
                 on_conflict: None,
                 constraint_name: None,
+                pk_suffix_len: 0,
             })]),
         );
 
@@ -2001,6 +2004,7 @@ mod tests {
                 index_method: None,
                 on_conflict: None,
                 constraint_name: None,
+                pk_suffix_len: 0,
             })]),
         );
 

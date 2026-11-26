@@ -29,8 +29,8 @@ use crate::vdbe::insn::{to_u32, ClearBtreeCount, Cookie};
 use crate::{bail_parse_error, LimboError, SymbolTable, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
     schema::{
-        is_deterministic_schema_function_call, BTreeTable, Index, IndexColumn, PseudoCursorType,
-        SchemaObjectType,
+        is_deterministic_schema_function_call, BTreeTable, Index, IndexColumn,
+        PrimaryKeySuffixOrder, PseudoCursorType, SchemaObjectType,
     },
     storage::pager::CreateBTreeFlags,
     util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
@@ -196,9 +196,6 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("virtual tables may not be indexed");
     };
-    if !tbl.has_rowid {
-        bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
-    }
     // Not checked when the schema loads or when a nested statement such as VACUUM
     // replays the stored schema, so databases that already have such an index keep
     // working.
@@ -278,7 +275,7 @@ pub fn translate_create_index(
             )?);
         }
     }
-    let idx = Arc::new(Index {
+    let mut idx = Index {
         name: idx_name.clone(),
         table_name: tbl.name.clone(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
@@ -292,7 +289,12 @@ pub fn translate_create_index(
         index_method: index_method.clone(),
         on_conflict: None,
         constraint_name: None,
-    });
+        pk_suffix_len: 0,
+    };
+    if !tbl.has_rowid && index_method.is_none() {
+        idx.append_primary_key_suffix(&tbl, PrimaryKeySuffixOrder::PrimaryKey)?;
+    }
+    let idx = Arc::new(idx);
 
     if !idx.validate_where_expr(&table, resolver) {
         crate::bail_parse_error!(
@@ -428,6 +430,7 @@ pub(crate) fn emit_refill_index(
         column_count: tbl.columns().len(),
     }));
     let columns = &idx.columns;
+    let record_len = columns.len() + usize::from(idx.has_rowid);
     let tbl_name = normalize_ident(tbl.name.as_str());
 
     let mut table_references = TableReferences::new(
@@ -562,7 +565,7 @@ pub(crate) fn emit_refill_index(
         program.emit_insn(Insn::OpenPseudo {
             cursor_id: pseudo_cursor_id,
             content_reg,
-            num_fields: columns.len() + 1,
+            num_fields: record_len,
         });
 
         program.emit_insn(Insn::OpenRead {
@@ -599,7 +602,7 @@ pub(crate) fn emit_refill_index(
             skip_row_label = Some(label);
         }
 
-        let start_reg = program.alloc_registers(columns.len() + 1);
+        let start_reg = program.alloc_registers(record_len);
         for (i, col) in columns.iter().enumerate() {
             emit_index_column_value_from_cursor(
                 program,
@@ -611,15 +614,16 @@ pub(crate) fn emit_refill_index(
                 start_reg + i,
             )?;
         }
-        let rowid_reg = start_reg + columns.len();
-        program.emit_insn(Insn::RowId {
-            cursor_id: table_cursor_id,
-            dest: rowid_reg,
-        });
+        if idx.has_rowid {
+            program.emit_insn(Insn::RowId {
+                cursor_id: table_cursor_id,
+                dest: start_reg + columns.len(),
+            });
+        }
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(start_reg),
-            count: to_u32(columns.len() + 1),
+            count: to_u32(record_len),
             dest_reg: to_u32(record_reg),
             index_name: Some(idx.name.clone()),
             affinity_str: None,
@@ -672,7 +676,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::SorterCompare {
                 cursor_id: sorter_cursor_id,
                 sorted_record_reg: content_reg,
-                num_regs: columns.len(),
+                num_regs: idx.key_columns().len(),
                 pc_when_nonequal: goto_label,
             });
             program.emit_insn(Insn::Halt {
@@ -761,9 +765,6 @@ pub fn translate_reindex(
             bail_parse_error!(
                 "REINDEX is not supported for custom index methods without a backing btree"
             );
-        }
-        if !table.has_rowid {
-            bail_parse_error!("REINDEX on WITHOUT ROWID tables is not supported");
         }
         let index_cursor_id = program.alloc_cursor_index(None, &index)?;
         emit_refill_index(

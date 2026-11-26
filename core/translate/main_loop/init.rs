@@ -622,6 +622,7 @@ fn right_join_metadata(
         index_method: None,
         on_conflict: None,
         constraint_name: None,
+        pk_suffix_len: 0,
     });
     Ok(RightJoinMetadata {
         matched_rows_cursor_id: program.alloc_cursor_id(CursorType::BTreeIndex(matched_rows_index)),

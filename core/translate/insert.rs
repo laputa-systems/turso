@@ -8,6 +8,7 @@ use crate::schema::ColumnLayout;
 use crate::security::permission::Object;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::RegisterColumn;
+use crate::translate::emitter::without_rowid::{self, DeletedRow};
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
@@ -487,10 +488,8 @@ pub fn translate_insert(
         if has_fks {
             crate::bail_parse_error!("foreign keys on WITHOUT ROWID tables are not supported");
         }
-        if on_conflict == Some(ResolveType::Replace) || !upsert_actions.is_empty() {
-            crate::bail_parse_error!(
-                "UPSERT and REPLACE on WITHOUT ROWID tables are not supported"
-            );
+        if !upsert_actions.is_empty() {
+            crate::bail_parse_error!("UPSERT on WITHOUT ROWID tables is not supported");
         }
         if cdc_table.is_some() {
             crate::bail_parse_error!("CDC on WITHOUT ROWID tables is not supported");
@@ -502,13 +501,6 @@ pub fn translate_insert(
             crate::bail_parse_error!(
                 "materialized views on WITHOUT ROWID tables are not supported"
             );
-        }
-        if resolver.with_schema(database_id, |s| {
-            s.get_indices(namespace.id, table_name.as_str())
-                .next()
-                .is_some()
-        }) {
-            crate::bail_parse_error!("secondary indexes on WITHOUT ROWID tables are not supported");
         }
     }
 
@@ -876,7 +868,7 @@ pub fn translate_insert(
 
     // Build a list of upsert constraints/indexes we need to run preflight
     // checks against, in the proper order of evaluation,
-    let constraints = build_constraints_to_check(
+    let mut constraints = build_constraints_to_check(
         table_name.as_str(),
         &upsert_actions,
         ctx.table.has_rowid,
@@ -886,6 +878,21 @@ pub fn translate_insert(
         ctx.table.rowid_alias_conflict_clause,
         ctx.statement_on_conflict.is_some(),
     );
+    if !ctx.table.has_rowid {
+        constraints
+            .constraints_to_check
+            .sort_by_key(|(constraint, _)| match constraint {
+                ResolvedUpsertTarget::PrimaryKey => {
+                    without_rowid::constraint_check_rank(ctx.table, None)
+                }
+                ResolvedUpsertTarget::Index(index) => {
+                    without_rowid::constraint_check_rank(ctx.table, Some(index))
+                }
+                ResolvedUpsertTarget::CatchAll => {
+                    unreachable!("a WITHOUT ROWID table has no UPSERT")
+                }
+            });
+    }
 
     // We need to separate index handling and insertion into a `preflight` and a
     // `commit` phase, because in UPSERT mode we might need to skip the actual insertion, as we can
@@ -959,7 +966,7 @@ pub fn translate_insert(
     // Create and insert the record
     emit_make_record(
         program,
-        insertion.col_mappings.iter().map(|m| m.column),
+        ctx.table.record_columns(),
         insertion.base_reg,
         insertion.record_register(),
     );
@@ -1309,11 +1316,8 @@ pub(crate) fn emit_column_type_conversion(
         }
         return Ok(());
     }
-    let affinities = table
-        .columns()
-        .iter()
-        .filter(|column| !column.is_virtual_generated())
-        .map(|column| column.affinity());
+    let record_columns = table.record_columns();
+    let affinities = record_columns.iter().map(|column| column.affinity());
     if affinities
         .clone()
         .all(|affinity| affinity == Affinity::Blob)
@@ -1637,7 +1641,8 @@ fn emit_commit_phase(
             emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
 
         let num_cols = index.columns.len();
-        let idx_start_reg = program.alloc_registers(num_cols + 1);
+        let record_len = num_cols + usize::from(index.has_rowid);
+        let idx_start_reg = program.alloc_registers(record_len);
 
         // Build [key cols..., rowid] from insertion registers
         for (i, idx_col) in index.columns.iter().enumerate() {
@@ -1650,16 +1655,18 @@ fn emit_commit_phase(
                 idx_start_reg + i,
             )?;
         }
-        program.emit_insn(Insn::Copy {
-            src_reg: insertion.key_register(),
-            dst_reg: idx_start_reg + num_cols,
-            extra_amount: 0,
-        });
+        if index.has_rowid {
+            program.emit_insn(Insn::Copy {
+                src_reg: insertion.key_register(),
+                dst_reg: idx_start_reg + num_cols,
+                extra_amount: 0,
+            });
+        }
 
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(idx_start_reg),
-            count: to_u32(num_cols + 1),
+            count: to_u32(record_len),
             dest_reg: to_u32(record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
@@ -1668,7 +1675,7 @@ fn emit_commit_phase(
             cursor_id: idx_cursor_id,
             record_reg,
             unpacked_start: Some(idx_start_reg),
-            unpacked_count: Some((num_cols + 1) as u32),
+            unpacked_count: Some(record_len as u32),
             flags: IdxInsertFlags::new().nchange(true),
         });
 
@@ -1677,6 +1684,22 @@ fn emit_commit_phase(
         }
     }
     Ok(())
+}
+
+/// The indexes of the WITHOUT ROWID table of `ctx` with their cursors.
+fn without_rowid_index_cursors(resolver: &Resolver, ctx: &InsertEmitCtx) -> Vec<(Arc<Index>, usize)> {
+    ctx.idx_cursors
+        .iter()
+        .map(|(name, _, cursor_id)| {
+            let index = resolver
+                .with_schema(ctx.namespace.database_id, |s| {
+                    s.get_index(ctx.namespace.id, ctx.table.name.as_str(), name)
+                        .cloned()
+                })
+                .expect("an index the INSERT opened is in the schema");
+            (index, *cursor_id)
+        })
+        .collect()
 }
 
 #[turso_macros::trace_stack]
@@ -3253,6 +3276,12 @@ fn emit_pk_uniqueness_check(
     preflight: &mut PreflightCtx,
 ) -> Result<()> {
     if !ctx.table.has_rowid {
+        // SQLite skips the check when REPLACE resolves it and no other index
+        // holds the row: the new row overwrites the old one.
+        if preflight.on_replace && position.or(upsert_catch_all).is_none() && ctx.idx_cursors.is_empty()
+        {
+            return Ok(());
+        }
         let pk_regs = program.alloc_registers(ctx.table.primary_key_columns.len());
         let pk_affinities = ctx
             .table
@@ -3293,6 +3322,20 @@ fn emit_pk_uniqueness_check(
             program.emit_insn(Insn::Goto {
                 target_pc: preflight.upsert_actions[position].1,
             });
+        } else if preflight.on_replace {
+            let indexes = without_rowid_index_cursors(resolver, ctx);
+            let table_references = &mut *preflight.table_references;
+            let table_internal_id = table_references.joined_tables()[0].internal_id;
+            without_rowid::emit_row_delete(
+                program,
+                resolver,
+                table_references,
+                table_internal_id,
+                ctx.table,
+                ctx.cursor_id,
+                &indexes,
+                DeletedRow::NotAChange,
+            )?;
         } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
             program.emit_insn(Insn::Goto {
                 target_pc: ctx.loop_labels.row_done,
@@ -3420,13 +3463,13 @@ fn emit_index_uniqueness_check(
     let maybe_skip_probe_label =
         emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
 
-    let num_cols = index.columns.len();
+    let num_cols = index.key_columns().len();
     // allocate scratch registers for the index columns plus rowid
     let idx_start_reg = program.alloc_registers(num_cols + 1);
 
     // build unpacked key [idx_start_reg .. idx_start_reg+num_cols-1], and rowid in last reg,
     // copy each index column from the table's column registers into these scratch regs
-    for (i, idx_col) in index.columns.iter().enumerate() {
+    for (i, idx_col) in index.key_columns().iter().enumerate() {
         emit_index_column_value_for_insert(
             program,
             resolver,
@@ -3436,12 +3479,14 @@ fn emit_index_uniqueness_check(
             idx_start_reg + i,
         )?;
     }
-    // last register is the rowid
-    program.emit_insn(Insn::Copy {
-        src_reg: insertion.key_register(),
-        dst_reg: idx_start_reg + num_cols,
-        extra_amount: 0,
-    });
+    if index.has_rowid {
+        // last register is the rowid
+        program.emit_insn(Insn::Copy {
+            src_reg: insertion.key_register(),
+            dst_reg: idx_start_reg + num_cols,
+            extra_amount: 0,
+        });
+    }
 
     emit_unique_index_check(
         program,
@@ -3478,7 +3523,7 @@ fn emit_unique_index_check(
     preflight: &mut PreflightCtx,
 ) -> Result<()> {
     let aff = index
-        .columns
+        .key_columns()
         .iter()
         .map(|ic| {
             if ic.expression().is_some() {
@@ -3520,6 +3565,29 @@ fn emit_unique_index_check(
                 });
             }
         }
+    } else if preflight.on_replace && !ctx.table.has_rowid {
+        let pk_reg = program.alloc_registers(ctx.table.primary_key_columns.len());
+        without_rowid::emit_primary_key_from_index(
+            program,
+            ctx.table,
+            index,
+            idx_cursor_id,
+            pk_reg,
+        );
+        without_rowid::emit_seek_primary_key(program, ctx.table, ctx.cursor_id, pk_reg, ok);
+        let indexes = without_rowid_index_cursors(resolver, ctx);
+        let table_references = &mut *preflight.table_references;
+        let table_internal_id = table_references.joined_tables()[0].internal_id;
+        without_rowid::emit_row_delete(
+            program,
+            resolver,
+            table_references,
+            table_internal_id,
+            ctx.table,
+            ctx.cursor_id,
+            &indexes,
+            DeletedRow::NotAChange,
+        )?;
     } else if preflight.on_replace {
         // REPLACE: delete conflicting row immediately, then insert eagerly.
         program.emit_insn(Insn::IdxRowId {
@@ -3740,11 +3808,11 @@ fn translate_virtual_table_insert(
 /// columns:     `t.c1` or `t.k, t.c1`
 /// expressions: `index 'i'`
 pub fn format_unique_violation_desc(table: &BTreeTable, index: &Index) -> String {
-    if index.columns.iter().any(|c| c.expression().is_some()) {
+    if index.key_columns().iter().any(|c| c.expression().is_some()) {
         return format!("index '{}'", index.name);
     }
     index
-        .columns
+        .key_columns()
         .iter()
         .map(|c| {
             let column = table.columns()[c.pos_in_table]

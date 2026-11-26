@@ -61,6 +61,7 @@ pub(crate) mod delete;
 pub(crate) mod gencol;
 pub(crate) mod select;
 pub(crate) mod update;
+pub(crate) mod without_rowid;
 
 /// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
 /// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).

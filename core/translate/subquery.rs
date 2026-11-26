@@ -1231,6 +1231,7 @@ fn get_subquery_parser<'a>(
                     index_method: None,
                     on_conflict: None,
                     constraint_name: None,
+                    pk_suffix_len: 0,
                 });
 
                 let cursor_id =

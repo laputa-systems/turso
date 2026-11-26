@@ -2415,6 +2415,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         index_method: None,
         on_conflict: None,
         constraint_name: None,
+        pk_suffix_len: 0,
     };
 
     pager.begin_read_tx().unwrap();

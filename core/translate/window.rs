@@ -741,6 +741,7 @@ fn allocate_window_minmax(
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         });
         let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index));
         let registers = program.alloc_registers(3);

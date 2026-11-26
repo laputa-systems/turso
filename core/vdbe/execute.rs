@@ -10363,7 +10363,7 @@ pub fn op_sorter_compare(
         && compare_immutable(
             previous_sorter_values,
             current_sorter_values,
-            &cursor.index_key_info,
+            &cursor.index_key_info[..*num_regs],
         )
         .is_eq();
     if is_equal {
@@ -12972,13 +12972,13 @@ pub fn op_idx_delete(
                 *state.active_op_state.idx_delete() = OpIdxDeleteState::Verifying;
             }
             OpIdxDeleteState::Verifying => {
-                let rowid = {
+                let (rowid, has_rowid) = {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(state, cursor.rowid())
+                    (return_if_io!(state, cursor.rowid()), cursor.has_rowid())
                 };
 
-                if rowid.is_none() && *raise_error_if_no_matching_entry {
+                if rowid.is_none() && has_rowid && *raise_error_if_no_matching_entry {
                     let reg_values = (*start_reg..*start_reg + *num_regs)
                         .map(|i| &state.registers[i])
                         .collect::<Vec<_>>();

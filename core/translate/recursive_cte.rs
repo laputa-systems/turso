@@ -283,6 +283,7 @@ fn open_recursive_cte_cursors(
                 index_method: None,
                 on_conflict: None,
                 constraint_name: None,
+                pk_suffix_len: 0,
             });
             let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
             program.emit_insn(Insn::OpenEphemeral {
@@ -326,6 +327,7 @@ fn open_recursive_cte_cursors(
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(seen_row_index.clone()));
         program.emit_insn(Insn::OpenEphemeral {

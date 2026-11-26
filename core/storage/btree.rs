@@ -12081,6 +12081,7 @@ mod tests {
                 index_method: None,
                 on_conflict: None,
                 constraint_name: None,
+                pk_suffix_len: 0,
             };
             let num_columns = index_def.columns.len();
             let mut cursor =
@@ -12255,6 +12256,7 @@ mod tests {
                 index_method: None,
                 on_conflict: None,
                 constraint_name: None,
+                pk_suffix_len: 0,
             };
             let mut cursor =
                 BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap();
@@ -12657,6 +12659,7 @@ mod tests {
                 index_method: None,
                 on_conflict: None,
                 constraint_name: None,
+                pk_suffix_len: 0,
             };
             let mut cursor =
                 BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap();
@@ -14405,6 +14408,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         };
         let mut cursor = BTreeCursor::new_index(pager.clone(), root_page, &index, 1).unwrap();
         let registers = [Register::Value(Value::from_i64(10))];
@@ -15238,6 +15242,7 @@ mod tests {
                 index_method: None,
                 on_conflict: None,
                 constraint_name: None,
+                pk_suffix_len: 0,
             };
             let new_cursor = || {
                 let cursor =

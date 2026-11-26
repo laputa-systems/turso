@@ -3334,6 +3334,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         });
         available_indexes.insert_for_table_name(
             table_references.joined_tables(),
@@ -3432,6 +3433,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         });
         available_indexes.insert_for_table_name(&joined_tables, "table1", VecDeque::from([index1]));
 
@@ -3576,6 +3578,7 @@ mod tests {
                     index_method: None,
                     on_conflict: None,
                     constraint_name: None,
+                    pk_suffix_len: 0,
                 });
                 available_indexes.insert_for_table_name(
                     &joined_tables,
@@ -3599,6 +3602,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         });
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
@@ -3616,6 +3620,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         });
 
         available_indexes.push_front_for_table_name(&joined_tables, "orders", customer_id_idx);
@@ -4130,6 +4135,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         });
 
         let mut available_indexes = AvailableIndexes::default();
@@ -4236,6 +4242,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         });
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -4356,6 +4363,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         });
         let table = Table::BTree(table);
         joined_tables.push(JoinedTable {
@@ -4552,6 +4560,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         })
     }
 
@@ -4705,6 +4714,7 @@ mod tests {
             index_method: None,
             on_conflict: None,
             constraint_name: None,
+            pk_suffix_len: 0,
         });
         available_indexes.insert_for_table_name(&joined_tables, "t2", VecDeque::from([index_t2_a]));
 
