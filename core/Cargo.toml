@@ -29,7 +29,9 @@ baseline = [
     "encryption",
     "percentile",
     "autovacuum",
+    "aegis",
 ]
+aegis = ["dep:aegis"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
 # Harness-side observability: turns on aristo's instrument surface so the
@@ -52,7 +54,7 @@ io_memory_yield = []
 serde = ["dep:serde", "turso_ast/serde"]
 series = []
 encryption = []
-pure-rust-crypto = ["aegis/pure-rust"]
+pure-rust-crypto = ["aegis", "aegis/pure-rust"]
 checksum = []
 cli_only = []
 test_helper = []
@@ -171,10 +173,10 @@ shuttle = { workspace = true }
 # Use pure-rust for Android and MacOS to avoid C cross-compilation issues.
 # Other targets can opt in via the `pure-rust-crypto` feature.
 [target.'cfg(any(target_os = "android", target_os = "macos"))'.dependencies]
-aegis = { version = "0.9.8", features = ["pure-rust"] }
+aegis = { version = "0.9.8", features = ["pure-rust"], optional = true }
 
 [target.'cfg(not(any(target_os = "android", target_os = "macos")))'.dependencies]
-aegis = { version = "0.9.8" }
+aegis = { version = "0.9.8", optional = true }
 
 [build-dependencies]
 cfg_aliases = "0.2.1"

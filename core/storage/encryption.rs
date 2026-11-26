@@ -2,11 +2,17 @@
 use crate::storage::sqlite3_ondisk::PageSize;
 use crate::turso_assert;
 use crate::{LimboError, Result};
+#[cfg(feature = "aegis")]
 use aegis::aegis128l::Aegis128L;
+#[cfg(feature = "aegis")]
 use aegis::aegis128x2::Aegis128X2;
+#[cfg(feature = "aegis")]
 use aegis::aegis128x4::Aegis128X4;
+#[cfg(feature = "aegis")]
 use aegis::aegis256::Aegis256;
+#[cfg(feature = "aegis")]
 use aegis::aegis256x2::Aegis256X2;
+#[cfg(feature = "aegis")]
 use aegis::aegis256x4::Aegis256X4;
 use aes_gcm::{
     aead::{Aead, AeadCore, AeadInPlace, KeyInit, OsRng},
@@ -170,6 +176,7 @@ impl Drop for EncryptionKey {
     }
 }
 
+#[cfg(feature = "aegis")]
 macro_rules! define_aegis_cipher {
     ($struct_name:ident, $cipher_type:ty, key128, $nonce_size:literal, $name:literal) => {
         define_aegis_cipher!(@impl $struct_name, $cipher_type, $nonce_size, $name, 16, as_128);
@@ -186,8 +193,8 @@ macro_rules! define_aegis_cipher {
         impl $struct_name {
             const TAG_SIZE: usize = 16;
 
-            fn new(key: &EncryptionKey) -> Self {
-                Self { key: key.clone() }
+            fn new(key: &EncryptionKey) -> Result<Self> {
+                Ok(Self { key: key.clone() })
             }
 
             fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, [u8; $nonce_size])> {
@@ -267,6 +274,53 @@ macro_rules! define_aegis_cipher {
                 f.debug_struct(stringify!($struct_name))
                     .field("key", &"<redacted>")
                     .finish()
+            }
+        }
+    };
+}
+
+#[cfg(not(feature = "aegis"))]
+macro_rules! define_aegis_cipher {
+    ($struct_name:ident, $cipher_type:ty, $key_kind:ident, $nonce_size:literal, $name:literal) => {
+        #[derive(Clone, Debug)]
+        pub struct $struct_name {
+            unavailable: std::convert::Infallible,
+        }
+
+        impl $struct_name {
+            fn new(key: &EncryptionKey) -> Result<Self> {
+                Err(LimboError::InvalidArgument(format!(
+                    "{} is not available: turso_core was built without the aegis feature",
+                    $name
+                )))
+            }
+
+            fn encrypt(&self, plaintext: &[u8], ad: &[u8]) -> Result<(Vec<u8>, [u8; $nonce_size])> {
+                match self.unavailable {}
+            }
+
+            fn encrypt_in_place(
+                &self,
+                plaintext_ciphertext: &mut [u8],
+                ad: &[u8],
+                tag_out: &mut [u8],
+                nonce_out: &mut [u8],
+            ) -> Result<()> {
+                match self.unavailable {}
+            }
+
+            fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; $nonce_size], ad: &[u8]) -> Result<Vec<u8>> {
+                match self.unavailable {}
+            }
+
+            fn decrypt_into(
+                &self,
+                ciphertext: &[u8],
+                nonce: &[u8; $nonce_size],
+                ad: &[u8],
+                out: &mut Vec<u8>,
+            ) -> Result<()> {
+                match self.unavailable {}
             }
         }
     };
@@ -593,12 +647,12 @@ impl EncryptionContext {
         let cipher = match cipher_mode {
             CipherMode::Aes128Gcm => Cipher::Aes128Gcm(Box::new(Aes128GcmCipher::new(key)?)),
             CipherMode::Aes256Gcm => Cipher::Aes256Gcm(Box::new(Aes256GcmCipher::new(key)?)),
-            CipherMode::Aegis256 => Cipher::Aegis256(Box::new(Aegis256Cipher::new(key))),
-            CipherMode::Aegis256X2 => Cipher::Aegis256X2(Box::new(Aegis256X2Cipher::new(key))),
-            CipherMode::Aegis256X4 => Cipher::Aegis256X4(Box::new(Aegis256X4Cipher::new(key))),
-            CipherMode::Aegis128L => Cipher::Aegis128L(Box::new(Aegis128LCipher::new(key))),
-            CipherMode::Aegis128X2 => Cipher::Aegis128X2(Box::new(Aegis128X2Cipher::new(key))),
-            CipherMode::Aegis128X4 => Cipher::Aegis128X4(Box::new(Aegis128X4Cipher::new(key))),
+            CipherMode::Aegis256 => Cipher::Aegis256(Box::new(Aegis256Cipher::new(key)?)),
+            CipherMode::Aegis256X2 => Cipher::Aegis256X2(Box::new(Aegis256X2Cipher::new(key)?)),
+            CipherMode::Aegis256X4 => Cipher::Aegis256X4(Box::new(Aegis256X4Cipher::new(key)?)),
+            CipherMode::Aegis128L => Cipher::Aegis128L(Box::new(Aegis128LCipher::new(key)?)),
+            CipherMode::Aegis128X2 => Cipher::Aegis128X2(Box::new(Aegis128X2Cipher::new(key)?)),
+            CipherMode::Aegis128X4 => Cipher::Aegis128X4(Box::new(Aegis128X4Cipher::new(key)?)),
             CipherMode::None => {
                 return Err(LimboError::InvalidArgument(
                     "must select valid CipherMode".into(),
