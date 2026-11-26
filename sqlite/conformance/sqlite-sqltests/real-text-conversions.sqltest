@@ -1,0 +1,65 @@
+@database :memory:
+
+# SQLite 3.53 writes a REAL as TEXT with printf('%!.17g'): 17 significant
+# digits, fewer when the last ones are 9s or 0s and the shorter text reads
+# back as the same double.
+test real-to-text-has-17-significant-digits {
+    SELECT CAST(1.0/3 AS TEXT), 0.1 || '', 49.47 || '', CAST(1e20 AS TEXT),
+           CAST(1e16 AS TEXT), CAST(1e-5 AS TEXT), CAST(-0.0 AS TEXT),
+           length(1.0/3), hex(0.5);
+}
+expect {
+    0.33333333333333332|0.1|49.47|1.0e+20|10000000000000000.0|1.0e-05|0.0|19|302E35
+}
+
+test real-result-has-17-significant-digits {
+    SELECT 1.0/3, 7788343286371649621.96335688107662E211;
+}
+expect {
+    0.33333333333333332|7.7883432863716492e+229
+}
+
+# quote() writes a REAL with printf('%!0.17g'), so an infinity is 9.0e+999.
+test quote-real-has-17-significant-digits {
+    SELECT quote(1.0/3), quote(1e400), quote(-1e400), quote(3.141592653589793);
+}
+expect {
+    0.33333333333333332|9.0e+999|-9.0e+999|3.1415926535897931
+}
+
+test printf-real-conversions-round-18-digits {
+    SELECT printf('%!.17g', 0.1), printf('%!.17g', 1.0/3), printf('%.20f', 1.0/3),
+           printf('%!.20f', 1.0/3), printf('%.17g', 49.47), printf('%!.17g', 49.47),
+           printf('%,.2f', 1234567.891), printf('%#.0e', 5.0);
+}
+expect {
+    0.1|0.33333333333333332|0.33333333333333330000|0.333333333333333315|49.47|49.47|1,234,567.89|5.e+00
+}
+
+# sqlite3AtoF reads at most about 19 significant digits, so the 23rd digit
+# of the first text does not round it up to 3500000000000000.5.
+test text-to-real-reads-19-digits {
+    SELECT CAST('3500000000000000.2500001' AS REAL) = 3500000000000000.0,
+           CAST(' 1e400 ' AS REAL), CAST('0.1' AS REAL) = 0.1,
+           CAST('4.9e-324' AS REAL) = 5e-324;
+}
+expect {
+    1|Inf|1|1
+}
+
+# round(X, N) reads back the text of printf('%!.*f', N, X).
+test round-reads-back-the-printf-text {
+    SELECT round(2.675, 2), round(1.005, 2), round(0.125, 2), round(-2.5),
+           round(1234.5678, 30);
+}
+expect {
+    2.67|1.0|0.13|-3.0|1234.5678
+}
+
+test sum-and-avg-read-text-with-atof {
+    SELECT sum(x), avg(x)
+    FROM (SELECT '47e-308' AS x UNION ALL SELECT '9e-300' UNION ALL SELECT '4e-300');
+}
+expect {
+    1.300000047e-299|4.3333334900000004e-300
+}

@@ -227,8 +227,7 @@ fn parse_date_or_time(value: &str, p: &mut DateTime, clock: &dyn Clock) -> Resul
         set_to_current(p, clock);
         return Ok(());
     }
-    let numeric_value = value.trim_matches(|c: char| u8::try_from(c).is_ok_and(is_space));
-    if let Ok(val) = numeric_value.parse::<f64>() {
+    if let Some(val) = whole_number(value) {
         p.s = val;
         p.raw_s = true;
         if (0.0..5373484.5).contains(&val) {
@@ -587,7 +586,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             .get(..8)
             .is_some_and(|s| s.eq_ignore_ascii_case("weekday ")) =>
         {
-            if let Ok(val) = z[8..].trim().parse::<f64>() {
+            if let Some(val) = whole_number(&z[8..]) {
                 if (0.0..7.0).contains(&val) && (val as i64 as f64) == val {
                     let n = val as i64;
                     p.compute_ymd_hms();
@@ -740,7 +739,7 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     // Case 3: NNN Units
     let is_sqlite_space = |c: char| u8::try_from(c).is_ok_and(is_space);
     if let Some((val_str, rest)) = z.split_once(is_sqlite_space) {
-        if let Ok(val) = val_str.parse::<f64>() {
+        if let Some(val) = whole_number(val_str) {
             let unit = rest.trim_start_matches(is_sqlite_space);
             let limit_check = |v: f64, limit: f64| v.abs() < limit;
             if unit.eq_ignore_ascii_case("day") || unit.eq_ignore_ascii_case("days") {
@@ -1317,7 +1316,7 @@ where
                 let s_str = s.as_str();
                 if s_str.eq_ignore_ascii_case("now") {
                     set_to_current(&mut p, clock);
-                } else if let Ok(val) = s_str.parse::<f64>() {
+                } else if let Some(val) = whole_number(s_str) {
                     p.s = val;
                     p.raw_s = true;
                     if p.s >= 0.0 && p.s < 5373484.5 {
@@ -1627,6 +1626,13 @@ fn push_zero_padded_any_width(res: &mut String, value: i64, width: usize) {
     for &digit in digits {
         res.push(char::from(digit));
     }
+}
+
+/// The REAL that `text` is, when all of it but surrounding whitespace is a
+/// number to sqlite3AtoF.
+fn whole_number(text: &str) -> Option<f64> {
+    let read = crate::numeric::fp::atof(text.as_bytes());
+    read.is_number().then_some(read.value)
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
-use crate::{turso_debug_assert, types::AsValueRef, Value, ValueRef};
+use crate::{types::AsValueRef, Value, ValueRef};
 
 pub mod decimal;
+pub(crate) mod fp;
 pub mod nonnan;
 
 use nonnan::NonNan;
@@ -81,6 +82,23 @@ impl Numeric {
                 }
             }
         }
+    }
+
+    /// The text of a REAL, as SQLite 3.53.4 converts a REAL to TEXT with
+    /// `printf('%!.17g', value)`: 17 significant digits, or fewer when the
+    /// last of them are 9s or 0s and the shorter text reads back as the same
+    /// double. One is `1.0`, 10^20 is `1.0e+20`, 0.1 is `0.1`, 1.0/3 is
+    /// `0.33333333333333332` and an infinity is `Inf` or `-Inf`.
+    pub fn real_to_text(value: f64) -> String {
+        format_float(value)
+    }
+
+    /// The REAL that SQLite 3.53.4 reads from the start of `text`, as
+    /// CAST(text AS REAL) does: leading and trailing whitespace is skipped,
+    /// reading stops at the first byte that does not continue the number or
+    /// at a NUL byte, and a text that does not start with a number is 0.0.
+    pub fn text_to_real(text: &[u8]) -> f64 {
+        fp::atof(text).value
     }
 
     #[inline]
@@ -430,100 +448,7 @@ impl std::ops::Rem for NullableInteger {
     }
 }
 
-// Maximum u64 that can survive a f64 round trip
-const MAX_EXACT: u64 = u64::MAX << 11;
-
 const VERTICAL_TAB: char = '\u{b}';
-
-/// Encapsulates Dekker's arithmetic for higher precision. This is spiritually the same as using a
-/// f128 for arithmetic, but cross platform and compatible with sqlite.
-#[derive(Debug, Clone, Copy)]
-pub struct DoubleDouble(pub f64, pub f64);
-
-impl DoubleDouble {
-    pub const E100: Self = DoubleDouble(1.0e+100, -1.590_289_110_975_991_8e83);
-    pub const E10: Self = DoubleDouble(1.0e+10, 0.0);
-    pub const E1: Self = DoubleDouble(1.0e+01, 0.0);
-
-    pub const NEG_E100: Self = DoubleDouble(1.0e-100, -1.999_189_980_260_288_3e-117);
-    pub const NEG_E10: Self = DoubleDouble(1.0e-10, -3.643_219_731_549_774e-27);
-    pub const NEG_E1: Self = DoubleDouble(1.0e-01, -5.551_115_123_125_783e-18);
-}
-
-impl From<u64> for DoubleDouble {
-    fn from(value: u64) -> Self {
-        let r = value as f64;
-
-        // If the value is smaller than MAX_EXACT, the error isn't significant
-        let rr = if r <= MAX_EXACT as f64 {
-            let round_tripped = value as f64 as u64;
-            let sign = if value >= round_tripped { 1.0 } else { -1.0 };
-
-            // Error term is the signed distance of the round tripped value and itself
-            sign * value.abs_diff(round_tripped) as f64
-        } else {
-            0.0
-        };
-
-        DoubleDouble(r, rr)
-    }
-}
-
-impl From<DoubleDouble> for u64 {
-    fn from(value: DoubleDouble) -> Self {
-        if value.1 < 0.0 {
-            value.0 as u64 - value.1.abs() as u64
-        } else {
-            value.0 as u64 + value.1 as u64
-        }
-    }
-}
-
-impl From<DoubleDouble> for f64 {
-    fn from(DoubleDouble(a, aa): DoubleDouble) -> Self {
-        a + aa
-    }
-}
-
-impl std::ops::Mul for DoubleDouble {
-    type Output = Self;
-
-    /// Double-Double multiplication.  (self.0, self.1) *= (rhs.0, rhs.1)
-    ///
-    /// Reference:
-    ///   T. J. Dekker, "A Floating-Point Technique for Extending the Available Precision".
-    ///   1971-07-26.
-    ///
-    fn mul(self, rhs: Self) -> Self::Output {
-        // TODO: Better variable naming
-
-        let mask = u64::MAX << 26;
-
-        let hx = f64::from_bits(self.0.to_bits() & mask);
-        let tx = self.0 - hx;
-
-        let hy = f64::from_bits(rhs.0.to_bits() & mask);
-        let ty = rhs.0 - hy;
-
-        let p = hx * hy;
-        let q = hx * ty + tx * hy;
-
-        let c = p + q;
-        let cc = p - c + q + tx * ty;
-        let cc = self.0 * rhs.1 + self.1 * rhs.0 + cc;
-
-        let r = c + cc;
-        let rr = (c - r) + cc;
-
-        DoubleDouble(r, rr)
-    }
-}
-
-impl std::ops::MulAssign for DoubleDouble {
-    fn mul_assign(&mut self, rhs: Self) {
-        *self = *self * rhs;
-    }
-}
 
 pub fn str_to_i64(input: impl AsRef<str>) -> Option<i64> {
     Some(match str_to_i64_checked(input) {
@@ -586,174 +511,24 @@ impl From<StrToF64> for f64 {
     }
 }
 
+/// The number at the start of `input`, as `sqlite3AtoF` reads it, and
+/// whether it fills the text and has a decimal point or an exponent. `None`
+/// when the text does not start with a number.
 pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
-    // Every character that the parser looks for is ASCII, so it reads bytes.
-    // A byte of a character that is not ASCII matches nothing, as the
-    // character does, so the parser stops at the same place.
-    let input = input
-        .as_ref()
-        .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == VERTICAL_TAB)
-        .as_bytes();
-    let digit_at = |pos: usize| match input.get(pos) {
-        Some(&byte @ b'0'..=b'9') => Some(byte - b'0'),
-        _ => None,
-    };
-    let mut pos = 0;
-
-    let sign = match input.first() {
-        Some(b'-') => {
-            pos += 1;
-            -1.0
-        }
-        Some(b'+') => {
-            pos += 1;
-            1.0
-        }
-        _ => 1.0,
-    };
-
-    let mut had_digits = false;
-    let mut is_fractional = false;
-
-    let mut significant: u64 = 0;
-
-    // Copy as many significant digits as we can
-    while let Some(digit) = digit_at(pos) {
-        had_digits = true;
-
-        match significant
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(u64::from(digit)))
-        {
-            Some(new) => significant = new,
-            None => break,
-        }
-
-        pos += 1;
-    }
-
-    let mut exponent = 0;
-
-    // Increment the exponent for every non significant digit we skipped
-    while digit_at(pos).is_some() {
-        exponent += 1;
-        pos += 1;
-    }
-
-    if input.get(pos) == Some(&b'.') {
-        pos += 1;
-
-        if had_digits {
-            is_fractional = true;
-        }
-
-        if digit_at(pos).is_some() {
-            is_fractional = true;
-        }
-
-        while let Some(digit) = digit_at(pos) {
-            if significant < (u64::MAX - 9) / 10 {
-                significant = significant * 10 + u64::from(digit);
-                exponent -= 1;
-            }
-
-            pos += 1;
-        }
-    };
-
-    let mut valid_exponent = true;
-
-    if (had_digits || is_fractional) && matches!(input.get(pos), Some(b'e' | b'E')) {
-        pos += 1;
-        let sign = match input.get(pos) {
-            Some(b'-') => {
-                pos += 1;
-                -1
-            }
-            Some(b'+') => {
-                pos += 1;
-                1
-            }
-            _ => 1,
-        };
-
-        if digit_at(pos).is_some() {
-            is_fractional = true;
-            let mut e = 0;
-
-            while let Some(digit) = digit_at(pos) {
-                e = (e * 10 + i32::from(digit)).min(1000);
-                pos += 1;
-            }
-
-            exponent += sign * e;
-        } else {
-            valid_exponent = false;
-        }
-    };
-
-    if !(had_digits || is_fractional) {
+    let read = fp::atof(input.as_ref().as_bytes());
+    if !read.has_prefix_number() {
         return None;
     }
-
-    while exponent.is_positive() && significant < MAX_EXACT / 10 {
-        significant *= 10;
-        exponent -= 1;
-    }
-
-    while exponent.is_negative() && significant % 10 == 0 {
-        significant /= 10;
-        exponent += 1;
-    }
-
-    let mut result = DoubleDouble::from(significant);
-
-    if exponent > 0 {
-        while exponent >= 100 {
-            exponent -= 100;
-            result *= DoubleDouble::E100;
-        }
-        while exponent >= 10 {
-            exponent -= 10;
-            result *= DoubleDouble::E10;
-        }
-        while exponent >= 1 {
-            exponent -= 1;
-            result *= DoubleDouble::E1;
-        }
-    } else {
-        while exponent <= -100 {
-            exponent += 100;
-            result *= DoubleDouble::NEG_E100;
-        }
-        while exponent <= -10 {
-            exponent += 10;
-            result *= DoubleDouble::NEG_E10;
-        }
-        while exponent <= -1 {
-            exponent += 1;
-            result *= DoubleDouble::NEG_E1;
-        }
-    }
-
-    let result = NonNan::new(f64::from(result) * sign)
-        .unwrap_or_else(|| NonNan::new(sign * f64::INFINITY).unwrap());
-
-    if !valid_exponent || pos < input.len() {
-        if is_fractional {
-            return Some(StrToF64::FractionalPrefix(result));
-        } else {
-            return Some(StrToF64::DecimalPrefix(result));
-        }
-    }
-
-    Some(if is_fractional {
-        StrToF64::Fractional(result)
-    } else {
-        StrToF64::Decimal(result)
+    let value = NonNan::new(read.value).expect("sqlite3AtoF never reads a NaN");
+    Some(match (read.is_number(), read.is_fractional()) {
+        (true, true) => StrToF64::Fractional(value),
+        (true, false) => StrToF64::Decimal(value),
+        (false, true) => StrToF64::FractionalPrefix(value),
+        (false, false) => StrToF64::DecimalPrefix(value),
     })
 }
 
+#[cfg(test)]
 pub fn round_half_away_from_zero_tie(f: f64, precision: usize) -> Option<f64> {
     use num_traits::Float;
 
@@ -792,233 +567,16 @@ pub fn round_half_away_from_zero_tie(f: f64, precision: usize) -> Option<f64> {
     Some(result)
 }
 
-enum FloatParts {
-    Special(String),
-    Normal {
-        negative: bool,
-        digits: DecimalDigits,
-        exp: i32,
-    },
-}
-
-fn decompose_float(v: f64, precision: usize) -> FloatParts {
-    if v.is_nan() {
-        return FloatParts::Special("".to_string());
-    }
-
-    if v.is_infinite() {
-        return FloatParts::Special(if v.is_sign_negative() { "-Inf" } else { "Inf" }.to_string());
-    }
-
-    if v == 0.0 {
-        return FloatParts::Special("0.0".to_string());
-    }
-
-    let negative = v < 0.0;
-    let mut d = DoubleDouble(v.abs(), 0.0);
-    let mut exp = 0;
-
-    if d.0 > 9.223_372_036_854_775e18 {
-        while d.0 > 9.223_372_036_854_774e118 {
-            exp += 100;
-            d *= DoubleDouble::NEG_E100;
-        }
-        while d.0 > 9.223_372_036_854_774e28 {
-            exp += 10;
-            d *= DoubleDouble::NEG_E10;
-        }
-        while d.0 > 9.223_372_036_854_775e18 {
-            exp += 1;
-            d *= DoubleDouble::NEG_E1;
-        }
-    } else {
-        while d.0 < 9.223_372_036_854_775e-83 {
-            exp -= 100;
-            d *= DoubleDouble::E100;
-        }
-        while d.0 < 9.223_372_036_854_775e7 {
-            exp -= 10;
-            d *= DoubleDouble::E10;
-        }
-        while d.0 < 9.223_372_036_854_775e17 {
-            exp -= 1;
-            d *= DoubleDouble::E1;
-        }
-    }
-
-    let mut digits = DecimalDigits::new(u64::from(d));
-    let mut decimal_pos = digits.len() as i32 + exp;
-
-    'out: {
-        if digits.len() > precision {
-            let round_up = digits[precision] >= b'5';
-            digits.truncate(precision);
-
-            if round_up {
-                for i in (0..precision).rev() {
-                    if digits[i] < b'9' {
-                        digits[i] += 1;
-                        break 'out;
-                    }
-                    digits[i] = b'0';
-                }
-
-                digits.push_carry(b'1');
-                decimal_pos += 1;
-            }
-        }
-    }
-
-    while digits.len() > 1 && digits[digits.len() - 1] == b'0' {
-        digits.pop();
-    }
-
-    FloatParts::Normal {
-        negative,
-        digits,
-        exp: decimal_pos - 1,
-    }
-}
-
-/// The decimal digits of a float as ASCII bytes, in `buf[start..end]`. A
-/// `u64` has at most 20 digits, which go after the first byte of `buf`. The
-/// first byte stays free for the carry digit of a rounding.
-struct DecimalDigits {
-    buf: [u8; 21],
-    start: usize,
-    end: usize,
-}
-
-impl DecimalDigits {
-    /// The decimal digits of `n`, with no leading zeros.
-    fn new(n: u64) -> Self {
-        let mut buf = [0u8; 21];
-        let after_carry: &mut [u8; 20] = (&mut buf[1..])
-            .try_into()
-            .expect("the buffer has 20 bytes after the carry byte");
-        let len = write_decimal_digits(after_carry, n).len();
-        Self {
-            buf,
-            start: 21 - len,
-            end: 21,
-        }
-    }
-
-    fn truncate(&mut self, len: usize) {
-        self.end = self.end.min(self.start + len);
-    }
-
-    /// Put `digit` before the other digits.
-    fn push_carry(&mut self, digit: u8) {
-        turso_debug_assert!(self.start > 0, "a rounding adds only one carry digit");
-        self.start -= 1;
-        self.buf[self.start] = digit;
-    }
-
-    fn pop(&mut self) {
-        turso_debug_assert!(self.end > self.start);
-        self.end -= 1;
-    }
-}
-
-impl std::ops::Deref for DecimalDigits {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        &self.buf[self.start..self.end]
-    }
-}
-
-impl std::ops::DerefMut for DecimalDigits {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[self.start..self.end]
-    }
-}
-
-fn format_float_scientific(v: f64, precision: usize) -> String {
-    match decompose_float(v, precision) {
-        FloatParts::Special(s) => s,
-        FloatParts::Normal {
-            negative,
-            digits,
-            exp,
-        } => format_scientific(negative, &digits, exp),
-    }
-}
-
+/// The text of a REAL, as SQLite writes it with `%!.17g`: CAST(x AS TEXT),
+/// `||`, a REAL read as TEXT.
 pub fn format_float(v: f64) -> String {
-    match decompose_float(v, 15) {
-        FloatParts::Special(s) => s,
-        FloatParts::Normal {
-            negative,
-            digits,
-            exp,
-        } => {
-            if (-4..=14).contains(&exp) {
-                format_decimal(negative, &digits, exp)
-            } else {
-                format_scientific(negative, &digits, exp)
-            }
-        }
-    }
-}
-
-/// Format `0.d1d2d3... * 10^(exp + 1)`, where `digits` are d1, d2, d3 and so
-/// on, as `[-]i.f`. Both `i` and `f` have at least one digit.
-fn format_decimal(negative: bool, digits: &[u8], exp: i32) -> String {
-    let decimal_pos = exp + 1;
-    let mut out = String::with_capacity(digits.len() + 24);
-    if negative {
-        out.push('-');
-    }
-    if decimal_pos > 0 {
-        let int_len = (decimal_pos as usize).min(digits.len());
-        push_ascii_digits(&mut out, &digits[..int_len]);
-        for _ in int_len..decimal_pos as usize {
-            out.push('0');
-        }
-    } else {
-        out.push('0');
-    }
-    out.push('.');
-    for _ in 0..decimal_pos.min(0).unsigned_abs() {
-        out.push('0');
-    }
-    match digits.get(decimal_pos.max(0) as usize..) {
-        Some(frac) if !frac.is_empty() => push_ascii_digits(&mut out, frac),
-        _ => out.push('0'),
-    }
+    let mut out = String::with_capacity(24);
+    let format = fp::RealFormat {
+        alt_form_2: true,
+        ..fp::RealFormat::new(fp::RealConversion::General, 17)
+    };
+    fp::push_real(&mut out, v, &format);
     out
-}
-
-/// Format the same value as [format_decimal] as `[-]d.ddde[+-]xx`. The
-/// exponent has at least two digits, and three when it is more than 99.
-fn format_scientific(negative: bool, digits: &[u8], exp: i32) -> String {
-    let mut out = String::with_capacity(digits.len() + 10);
-    if negative {
-        out.push('-');
-    }
-    out.push(digits.first().copied().unwrap_or(b'0') as char);
-    out.push('.');
-    match digits.get(1..) {
-        Some(rest) if !rest.is_empty() => push_ascii_digits(&mut out, rest),
-        _ => out.push('0'),
-    }
-    out.push('e');
-    out.push(if exp >= 0 { '+' } else { '-' });
-    let mut buf = [0u8; 20];
-    let exp_digits = write_decimal_digits(&mut buf, u64::from(exp.unsigned_abs()));
-    let width = if exp.unsigned_abs() > 99 { 3 } else { 2 };
-    for _ in exp_digits.len()..width {
-        out.push('0');
-    }
-    push_ascii_digits(&mut out, exp_digits);
-    out
-}
-
-fn push_ascii_digits(out: &mut String, digits: &[u8]) {
-    // SAFETY: `digits` holds only the ASCII bytes b'0'..=b'9'.
-    out.push_str(unsafe { str::from_utf8_unchecked(digits) });
 }
 
 /// The decimal text of an `i64`, the same text as `i64::to_string()`, in a
@@ -1083,35 +641,32 @@ pub(crate) const DIGIT_PAIRS: &str = "\
     6061626364656667686970717273747576777879\
     8081828384858687888990919293949596979899";
 
+/// The text of a REAL in an SQL statement, as quote() writes it with
+/// `%!0.17g`: an infinity is 9.0e+999.
 pub fn format_float_for_quote(v: f64) -> String {
     if v.is_nan() {
         return "NULL".to_string();
     }
-    if v.is_infinite() {
-        return if v.is_sign_negative() {
-            "-9.0e+999".to_string()
-        } else {
-            "9.0e+999".to_string()
-        };
-    }
-    let default = format_float(v);
-    if str_to_f64(&default).map(f64::from) == Some(v) {
-        return default;
-    }
-    format_float_scientific(v, 19)
+    let mut out = String::with_capacity(24);
+    let format = fp::RealFormat {
+        alt_form_2: true,
+        zero_pad: true,
+        ..fp::RealFormat::new(fp::RealConversion::General, 17)
+    };
+    fp::push_real(&mut out, v, &format);
+    out
 }
 
 #[test]
 fn test_decode_float() {
-    assert_eq!(format_float(9.93e-322), "9.93071948140905e-322");
+    assert_eq!(format_float(9.93e-322), "9.9307194814090555e-322");
     assert_eq!(format_float(9.93), "9.93");
     assert_eq!(format_float(0.093), "0.093");
     assert_eq!(format_float(-0.093), "-0.093");
     assert_eq!(format_float(0.0), "0.0");
-    assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
+    assert_eq!(format_float(4.94e-322), "4.9406564584124654e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
-    // The rounding carries into a new leading digit.
-    assert_eq!(format_float(9.999999999999998), "10.0");
+    assert_eq!(format_float(9.999999999999998), "9.9999999999999982");
 }
 
 #[test]

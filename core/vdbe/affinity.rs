@@ -2,7 +2,7 @@ use crate::ast::{Expr, Literal};
 use either::Either;
 
 use crate::{
-    numeric::{format_float, DoubleDouble, Numeric},
+    numeric::{format_float, Numeric},
     types::AsValueRef,
     Value, ValueRef,
 };
@@ -411,236 +411,53 @@ impl ParsedNumber {
     }
 }
 
+/// The number at the start of `bytes`. The REAL is the one sqlite3AtoF
+/// reads, and the text is an integer when it has no decimal point or
+/// exponent and its digits fit in an i64.
 pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
-    if bytes.is_empty() {
+    let read = crate::numeric::fp::atof(bytes);
+    let parse_result = if !read.has_prefix_number() {
         return (NumericParseResult::NotNumeric, ParsedNumber::None);
-    }
-
-    let mut pos = 0;
-    let len = bytes.len();
-
-    while pos < len && is_space(bytes[pos]) {
-        pos += 1;
-    }
-
-    if pos >= len {
-        return (NumericParseResult::NotNumeric, ParsedNumber::None);
-    }
-
-    let mut sign = 1i64;
-
-    if bytes[pos] == b'-' {
-        sign = -1;
-        pos += 1;
-    } else if bytes[pos] == b'+' {
-        pos += 1;
-    }
-
-    if pos >= len {
-        return (NumericParseResult::NotNumeric, ParsedNumber::None);
-    }
-
-    let mut significand = 0u64;
-    let mut decimal_adjust = 0i32;
-    let mut has_digits = false;
-
-    // Parse digits before decimal point
-    while pos < len && bytes[pos].is_ascii_digit() {
-        has_digits = true;
-        let digit = (bytes[pos] - b'0') as u64;
-
-        if significand <= (u64::MAX - 9) / 10 {
-            significand = significand * 10 + digit;
-        } else {
-            // Skip overflow digits but adjust exponent
-            decimal_adjust += 1;
-        }
-        pos += 1;
-    }
-
-    let mut has_decimal = false;
-    let mut has_exponent = false;
-
-    // Check for decimal point
-    if pos < len && bytes[pos] == b'.' {
-        has_decimal = true;
-        pos += 1;
-
-        // Parse fractional digits
-        while pos < len && bytes[pos].is_ascii_digit() {
-            has_digits = true;
-            let digit = (bytes[pos] - b'0') as u64;
-
-            if significand <= (u64::MAX - 9) / 10 {
-                significand = significand * 10 + digit;
-                decimal_adjust -= 1;
-            }
-            pos += 1;
-        }
-    }
-
-    if !has_digits {
-        return (NumericParseResult::NotNumeric, ParsedNumber::None);
-    }
-
-    // Check for exponent
-    let mut exponent = 0i32;
-    if pos < len && (bytes[pos] == b'e' || bytes[pos] == b'E') {
-        has_exponent = true;
-        pos += 1;
-
-        if pos >= len {
-            // Incomplete exponent, but we have valid digits before
-            return create_result_from_significand(
-                significand,
-                sign,
-                decimal_adjust,
-                has_decimal,
-                has_exponent,
-                NumericParseResult::ValidPrefixOnly,
-            );
-        }
-
-        let mut exp_sign = 1i32;
-        if bytes[pos] == b'-' {
-            exp_sign = -1;
-            pos += 1;
-        } else if bytes[pos] == b'+' {
-            pos += 1;
-        }
-
-        if pos >= len || !bytes[pos].is_ascii_digit() {
-            // Incomplete exponent
-            return create_result_from_significand(
-                significand,
-                sign,
-                decimal_adjust,
-                has_decimal,
-                false,
-                NumericParseResult::ValidPrefixOnly,
-            );
-        }
-
-        // Parse exponent digits
-        while pos < len && bytes[pos].is_ascii_digit() {
-            let digit = (bytes[pos] - b'0') as i32;
-            if exponent < 10000 {
-                exponent = exponent * 10 + digit;
-            } else {
-                exponent = 10000; // Cap at large value
-            }
-            pos += 1;
-        }
-        exponent *= exp_sign;
-    }
-
-    // Skip trailing whitespace
-    while pos < len && is_space(bytes[pos]) {
-        pos += 1;
-    }
-
-    // Determine if we consumed the entire string
-    let consumed_all = pos >= len;
-    let final_exponent = decimal_adjust + exponent;
-
-    let parse_result = if !consumed_all {
+    } else if !read.is_number() {
         NumericParseResult::ValidPrefixOnly
-    } else if has_decimal || has_exponent {
+    } else if read.is_fractional() {
         NumericParseResult::HasDecimalOrExp
     } else {
         NumericParseResult::PureInteger
     };
-
-    create_result_from_significand(
-        significand,
-        sign,
-        final_exponent,
-        has_decimal,
-        has_exponent,
-        parse_result,
-    )
+    if !read.is_fractional() {
+        if let Some(integer) = leading_integer(bytes) {
+            return (parse_result, ParsedNumber::Integer(integer));
+        }
+    }
+    (parse_result, ParsedNumber::Float(read.value))
 }
 
-fn create_result_from_significand(
-    significand: u64,
-    sign: i64,
-    exponent: i32,
-    has_decimal: bool,
-    has_exponent: bool,
-    parse_result: NumericParseResult,
-) -> (NumericParseResult, ParsedNumber) {
-    if significand == 0 {
-        match parse_result {
-            NumericParseResult::PureInteger => {
-                return (parse_result, ParsedNumber::Integer(0));
-            }
-            _ => {
-                return (parse_result, ParsedNumber::Float(0.0));
-            }
-        }
+/// The integer that the optional whitespace, sign and digits at the start of
+/// `bytes` write, when it fits in an i64. The digits were accumulated as an
+/// unsigned magnitude, so the limit is sign-dependent: a negative number may
+/// reach |i64::MIN| == i64::MAX + 1, as in sqlite3Atoi64.
+fn leading_integer(bytes: &[u8]) -> Option<i64> {
+    let mut pos = 0;
+    while bytes.get(pos).copied().is_some_and(is_space) {
+        pos += 1;
     }
-
-    // For pure integers without exponent, try to return as integer.
-    // The digits were accumulated as an unsigned magnitude, so the limit is
-    // sign-dependent: a negative number may reach |i64::MIN| == i64::MAX + 1.
-    // This mirrors sqlite3Atoi64, which compares against "9223372036854775807"
-    // for positives and "9223372036854775808" for negatives.
-    let magnitude_limit = if sign < 0 {
-        i64::MAX as u64 + 1
+    let negative = bytes.get(pos) == Some(&b'-');
+    if matches!(bytes.get(pos), Some(b'-' | b'+')) {
+        pos += 1;
+    }
+    let mut magnitude: u64 = 0;
+    while let Some(&byte @ b'0'..=b'9') = bytes.get(pos) {
+        magnitude = magnitude
+            .checked_mul(10)?
+            .checked_add(u64::from(byte - b'0'))?;
+        pos += 1;
+    }
+    if negative {
+        (magnitude <= i64::MAX as u64 + 1).then(|| (magnitude as i64).wrapping_neg())
     } else {
-        i64::MAX as u64
-    };
-    if !has_decimal && !has_exponent && exponent == 0 && significand <= magnitude_limit {
-        let signed_val = (significand as i64).wrapping_mul(sign);
-        return (parse_result, ParsedNumber::Integer(signed_val));
+        i64::try_from(magnitude).ok()
     }
-
-    // Convert to float using Dekker double-double arithmetic for precision
-    // This matches SQLite's sqlite3AtoF implementation
-    let mut result = DoubleDouble::from(significand);
-
-    let mut exp = exponent;
-    match exp.cmp(&0) {
-        std::cmp::Ordering::Greater => {
-            while exp >= 100 {
-                result *= DoubleDouble::E100;
-                exp -= 100;
-            }
-            while exp >= 10 {
-                result *= DoubleDouble::E10;
-                exp -= 10;
-            }
-            while exp >= 1 {
-                result *= DoubleDouble::E1;
-                exp -= 1;
-            }
-        }
-        std::cmp::Ordering::Less => {
-            while exp <= -100 {
-                result *= DoubleDouble::NEG_E100;
-                exp += 100;
-            }
-            while exp <= -10 {
-                result *= DoubleDouble::NEG_E10;
-                exp += 10;
-            }
-            while exp <= -1 {
-                result *= DoubleDouble::NEG_E1;
-                exp += 1;
-            }
-        }
-        std::cmp::Ordering::Equal => {}
-    }
-
-    let mut final_result: f64 = result.into();
-    if final_result.is_nan() {
-        final_result = f64::INFINITY;
-    }
-    if sign < 0 {
-        final_result = -final_result;
-    }
-
-    (parse_result, ParsedNumber::Float(final_result))
 }
 
 pub fn is_space(byte: u8) -> bool {

@@ -1,7 +1,11 @@
 use crate::types::TextSubtype;
 use crate::{
     function::MathFunc,
-    numeric::{format_float, format_float_for_quote, IntegerText, NullableInteger, Numeric},
+    numeric::fp::{self, RealConversion, RealFormat},
+    numeric::{
+        format_float, format_float_for_quote, nonnan::NonNan, IntegerText, NullableInteger,
+        Numeric,
+    },
     translate::collate::CollationSeq,
     turso_assert,
     types::{AsValueRef, SeekOp, Text},
@@ -10,7 +14,6 @@ use crate::{
 };
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::fmt::Write as _;
 
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
 #[cfg(not(test))]
@@ -323,18 +326,13 @@ impl Value {
             Value::Numeric(Numeric::Integer(v)) => {
                 Value::from_i64(v.checked_abs().ok_or_else(|| LimboError::IntegerOverflow)?)
             }
-            Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
-            _ => {
-                let s = match self {
-                    Value::Text(text) => std::borrow::Cow::Borrowed(text.as_str()),
-                    Value::Blob(blob) => String::from_utf8_lossy(blob),
-                    _ => unreachable!(),
-                };
-
-                crate::numeric::str_to_f64(s)
-                    .map(|v| Value::from_f64(f64::from(v).abs()))
-                    .unwrap_or_else(|| Value::from_f64(0.0))
+            Value::Numeric(Numeric::Float(non_nan)) => {
+                Value::from_f64(sqlite_real_abs(f64::from(*non_nan)))
             }
+            Value::Text(text) => Value::from_f64(sqlite_real_abs(Numeric::text_to_real(
+                text.as_str().as_bytes(),
+            ))),
+            Value::Blob(blob) => Value::from_f64(sqlite_real_abs(Numeric::text_to_real(blob))),
         })
     }
 
@@ -913,17 +911,14 @@ impl Value {
             return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
-        let f: f64 =
-            crate::numeric::round_half_away_from_zero_tie(f, precision).unwrap_or_else(|| {
-                // A sign, at most 16 integer digits, a point and at most 30 decimals.
-                let mut text = StackText::<64>::new();
-                write!(text, "{f:.precision$}").expect("the rounded float fits in 64 bytes");
-                crate::numeric::str_to_f64(text.as_str())
-                    .expect("formatted float should always parse successfully")
-                    .into()
-            });
-
-        Value::from_f64(f)
+        // SQLite rounds by reading back the text of printf('%!.*f', n, x).
+        let mut text = String::with_capacity(48);
+        let format = RealFormat {
+            alt_form_2: true,
+            ..RealFormat::new(RealConversion::Fixed, precision)
+        };
+        fp::push_real(&mut text, f, &format);
+        Value::from_f64(Numeric::text_to_real(text.as_bytes()))
     }
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
@@ -1257,19 +1252,35 @@ impl Value {
     }
 
     pub fn exec_add(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_add(Numeric::from_value(rhs)?))().into()
+        (|| {
+            let (lhs, rhs) = arithmetic_operands(self, rhs)?;
+            lhs.checked_add(rhs)
+        })()
+        .into()
     }
 
     pub fn exec_subtract(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?))().into()
+        (|| {
+            let (lhs, rhs) = arithmetic_operands(self, rhs)?;
+            lhs.checked_sub(rhs)
+        })()
+        .into()
     }
 
     pub fn exec_multiply(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?))().into()
+        (|| {
+            let (lhs, rhs) = arithmetic_operands(self, rhs)?;
+            lhs.checked_mul(rhs)
+        })()
+        .into()
     }
 
     pub fn exec_divide(&self, rhs: &Value) -> Value {
-        (|| Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?))().into()
+        (|| {
+            let (lhs, rhs) = arithmetic_operands(self, rhs)?;
+            lhs.checked_div(rhs)
+        })()
+        .into()
     }
 
     pub fn exec_bit_and(&self, rhs: &Value) -> Value {
@@ -1718,33 +1729,40 @@ fn trim_spaces(text: &str, left: bool, right: bool) -> &str {
     &text[start..end]
 }
 
-/// Text of at most `N` bytes in a stack buffer, written with `write!`.
-struct StackText<const N: usize> {
-    buf: [u8; N],
-    len: usize,
-}
-
-impl<const N: usize> StackText<N> {
-    fn new() -> Self {
-        Self {
-            buf: [0; N],
-            len: 0,
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.buf[..self.len]).expect("only whole strings are written")
+/// abs() of a REAL as SQLite computes it, which negates only a value below
+/// zero, so abs(-0.0) is -0.0.
+fn sqlite_real_abs(value: f64) -> f64 {
+    if value < 0.0 {
+        -value
+    } else {
+        value
     }
 }
 
-impl<const N: usize> std::fmt::Write for StackText<N> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        let end = self.len + s.len();
-        let dst = self.buf.get_mut(self.len..end).ok_or(std::fmt::Error)?;
-        dst.copy_from_slice(s.as_bytes());
-        self.len = end;
-        Ok(())
+/// The operands of `+`, `-`, `*` and `/`, as SQLite's arithmetic opcodes
+/// read them. When an operand is not an integer, both are read as REALs, and
+/// a TEXT or BLOB operand is read again with sqlite3AtoF, so `'-0' * 1.0`
+/// is -0.0 although `'-0'` is the integer 0.
+fn arithmetic_operands(lhs: &Value, rhs: &Value) -> Option<(Numeric, Numeric)> {
+    let numbers = (Numeric::from_value(lhs)?, Numeric::from_value(rhs)?);
+    if let (Numeric::Integer(_), Numeric::Integer(_)) = numbers {
+        return Some(numbers);
     }
+    Some((
+        real_operand(lhs, numbers.0),
+        real_operand(rhs, numbers.1),
+    ))
+}
+
+fn real_operand(value: &Value, number: Numeric) -> Numeric {
+    let text = match (value, number) {
+        (_, Numeric::Float(_)) | (Value::Null | Value::Numeric(_), _) => return number,
+        (Value::Text(text), Numeric::Integer(_)) => text.as_str().as_bytes(),
+        (Value::Blob(blob), Numeric::Integer(_)) => blob.as_slice(),
+    };
+    Numeric::Float(
+        NonNan::new(Numeric::text_to_real(text)).expect("sqlite3AtoF never reads a NaN"),
+    )
 }
 
 /// `source.replace(pattern, replacement)`, with the result allocated at the
@@ -2528,6 +2546,34 @@ mod tests {
     }
 
     #[test]
+    fn real_arithmetic_reads_a_text_operand_as_a_real() {
+        let bits = |value: Value| match value {
+            Value::Numeric(Numeric::Float(float)) => f64::from(float).to_bits(),
+            other => panic!("expected a REAL, got {other:?}"),
+        };
+        let minus_zero = (-0.0f64).to_bits();
+        let text = Value::build_text("-0");
+        assert_eq!(bits(text.exec_multiply(&Value::from_f64(1.0))), minus_zero);
+        assert_eq!(bits(text.exec_divide(&Value::from_f64(1.0))), minus_zero);
+        let blob = Value::from_slice(b"-0").unwrap();
+        assert_eq!(bits(blob.exec_multiply(&Value::from_f64(1.0))), minus_zero);
+        assert_eq!(text.exec_add(&Value::from_i64(0)), Value::from_i64(0));
+    }
+
+    #[test]
+    fn abs_keeps_the_sign_of_a_negative_zero() {
+        let minus_zero = (-0.0f64).to_bits();
+        for value in [Value::from_f64(-0.0), Value::build_text("-0"), Value::build_text("-0.0")] {
+            match value.exec_abs().unwrap() {
+                Value::Numeric(Numeric::Float(float)) => {
+                    assert_eq!(f64::from(float).to_bits(), minus_zero, "abs({value:?})")
+                }
+                other => panic!("abs({value:?}) is {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn test_exec_divide() {
         let inputs = vec![
             (Value::from_i64(1), Value::from_i64(0)),
@@ -2813,7 +2859,7 @@ mod tests {
         assert_eq!(input.exec_quote(), expected);
 
         let input = Value::from_f64(std::f64::consts::PI);
-        let expected = Value::build_text("3.141592653589793116e+00");
+        let expected = Value::build_text("3.1415926535897931");
         assert_eq!(input.exec_quote(), expected);
 
         let input = Value::from_f64(
@@ -2821,7 +2867,7 @@ mod tests {
                 .map(f64::from)
                 .unwrap(),
         );
-        let expected = Value::build_text("2.042747795102219097e+05");
+        let expected = Value::build_text("204274.77951022191");
         assert_eq!(input.exec_quote(), expected);
 
         let input = blob(&[0xDE, 0xAD, 0xBE, 0xEF]);
