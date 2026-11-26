@@ -11,19 +11,24 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+/// Renames the parent column `from` of `clause` to `to` when the clause
+/// references `table`, and says whether it renamed one.
 pub fn rewrite_fk_parent_cols_if_self_ref(
     clause: &mut ast::ForeignKeyClause,
     table: &str,
     from: &str,
     to: &str,
-) {
+) -> bool {
+    let mut renamed = false;
     if clause.tbl_name.as_str().eq_ignore_ascii_case(table) {
         for c in &mut clause.columns {
             if c.col_name.as_str().eq_ignore_ascii_case(from) {
                 c.col_name = c.col_name.renamed(to);
+                renamed = true;
             }
         }
     }
+    renamed
 }
 
 /// Rewrite column name references; used in e.g. ALTER TABLE RENAME COLUMN
@@ -1292,12 +1297,14 @@ pub fn rewrite_column_level_fk_parent_columns_if_needed(
     table: &str,
     from: &str,
     to: &str,
-) {
+) -> bool {
+    let mut renamed = false;
     for cc in &mut col.constraints {
         if let ast::ColumnConstraint::ForeignKey { clause, .. } = &mut cc.constraint {
-            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+            renamed |= rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
         }
     }
+    renamed
 }
 
 /// If a FK REFERENCES targets `old_tbl`, change it to `new_tbl`

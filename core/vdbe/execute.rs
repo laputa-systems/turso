@@ -11689,18 +11689,13 @@ pub fn op_function(
                                         }
                                     }
                                     for col in &mut columns {
-                                        let _before = fk_updated;
-                                        let mut local_col = col.clone();
-                                        rewrite_column_level_fk_parent_columns_if_needed(
-                                            &mut local_col,
-                                            &table,
-                                            &rename_from,
-                                            column_def.col_name.as_str(),
-                                        );
-                                        if local_col != *col {
-                                            *col = local_col;
-                                            fk_updated = true;
-                                        }
+                                        fk_updated |=
+                                            rewrite_column_level_fk_parent_columns_if_needed(
+                                                col,
+                                                &table,
+                                                &rename_from,
+                                                column_def.col_name.as_str(),
+                                            );
                                     }
 
                                     // Only return updated SQL if we actually changed something
