@@ -12,15 +12,25 @@ use crate::schema::{BTreeTable, Column, Index};
 use crate::sync::Arc;
 use crate::translate::emitter::without_rowid::constraint_check_rank;
 use crate::translate::optimizer::constraints::RangeConstraintRef;
-use crate::translate::plan::{IterationDirection, JoinedTable};
+use crate::translate::plan::{ColumnUsedMask, IterationDirection, JoinedTable};
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 
 /// The statement that reads a WITHOUT ROWID table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Reader {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Reader<'a> {
     Select,
-    /// An UPDATE, whose loop SQLite never takes an index for covering.
-    Update,
+    /// An UPDATE whose WHERE clause reads these columns of the table. SQLite
+    /// counts only them when it costs a full scan of an index, and never
+    /// takes an index for covering when it costs a seek, because the loop
+    /// has no SELECT.
+    Update(&'a ColumnUsedMask),
+}
+
+/// Whether a scan is a full scan or a seek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    FullScan,
+    Seek,
 }
 
 /// A full scan of a WITHOUT ROWID table through its table b-tree, for None,
@@ -40,7 +50,7 @@ pub(crate) fn sqlite_full_scan<'a>(
     joined_table: &JoinedTable,
     table: &BTreeTable,
     scans: &'a [FullScan],
-    reader: Reader,
+    reader: Reader<'_>,
 ) -> Option<&'a FullScan> {
     let table_width = table
         .columns()
@@ -77,7 +87,7 @@ pub(crate) fn sqlite_full_scan<'a>(
                     })
                     .sum();
                 let partial = index.where_clause.is_some();
-                if covers(joined_table, index, reader) {
+                if covers(joined_table, index, reader, Access::FullScan) {
                     cost(width, partial)
                 } else {
                     let rows: i64 = if partial { 190 } else { 200 };
@@ -105,7 +115,7 @@ pub(crate) fn primary_key_serves_seek(
     table: &BTreeTable,
     index: &Index,
     constraint_refs: &[RangeConstraintRef],
-    reader: Reader,
+    reader: Reader<'_>,
 ) -> bool {
     for (position, constraint) in constraint_refs.iter().enumerate() {
         let Some((pk_name, _)) = table.primary_key_columns.get(position) else {
@@ -125,7 +135,7 @@ pub(crate) fn primary_key_serves_seek(
             return false;
         }
     }
-    if !covers(joined_table, index, reader) {
+    if !covers(joined_table, index, reader, Access::Seek) {
         return true;
     }
     let table_width = table
@@ -160,16 +170,22 @@ pub(crate) fn primary_key_serves_seek(
 /// SQLite records which columns the index of a UNIQUE constraint holds
 /// before convertToWithoutRowidTable appends the PRIMARY KEY to it, so only
 /// the declared key of such an index counts.
-fn covers(joined_table: &JoinedTable, index: &Index, reader: Reader) -> bool {
-    if reader == Reader::Update {
-        return false;
-    }
-    if !index.name.starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX) {
-        return joined_table.index_is_covering(index);
-    }
-    joined_table.col_used_mask.iter().all(|position| {
-        index
-            .key_columns()
+fn covers(joined_table: &JoinedTable, index: &Index, reader: Reader<'_>, access: Access) -> bool {
+    let used_columns = match reader {
+        Reader::Update(_) if access == Access::Seek => return false,
+        Reader::Update(where_columns) => where_columns,
+        Reader::Select if !index.name.starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX) => {
+            return joined_table.index_is_covering(index);
+        }
+        Reader::Select => &joined_table.col_used_mask,
+    };
+    let held_columns = if index.name.starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX) {
+        index.key_columns()
+    } else {
+        &index.columns
+    };
+    used_columns.iter().all(|position| {
+        held_columns
             .iter()
             .any(|column| column.expression().is_none() && column.pos_in_table == position)
     })

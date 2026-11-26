@@ -361,3 +361,16 @@ expect {
     2|q
     1|p
 }
+
+@cross-check-integrity
+test without-rowid-update-scans-narrowest-index {
+    CREATE TABLE t(a LONGVARCHAR PRIMARY KEY, b NUMERIC, UNIQUE(b)) WITHOUT ROWID;
+    CREATE UNIQUE INDEX ta ON t(a DESC);
+    INSERT INTO t VALUES ('a', NULL), ('b', 7);
+    UPDATE OR IGNORE t SET b = 'ab';
+    SELECT * FROM t;
+}
+expect {
+    a|
+    b|ab
+}

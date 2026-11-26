@@ -502,10 +502,9 @@ pub(super) fn choose_best_btree_candidate(
         return Ok(None);
     }
     if let Some(table) = rhs_table.btree().filter(|table| !table.has_rowid) {
-        let reader = if available_indexes.updates_without_rowid_table() {
-            super::without_rowid_scan::Reader::Update
-        } else {
-            super::without_rowid_scan::Reader::Select
+        let reader = match available_indexes.update_where_columns() {
+            Some(where_columns) => super::without_rowid_scan::Reader::Update(where_columns),
+            None => super::without_rowid_scan::Reader::Select,
         };
         let primary_key_serves_seek = has_rowid_candidate
             && !best_is_ordered

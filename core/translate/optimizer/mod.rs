@@ -13,7 +13,7 @@ use crate::alloc::{TursoIteratorExt, TursoVecExt};
 use crate::ast::RefAct;
 use crate::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, TriggerEvent};
 use crate::schema::GeneratedType;
-use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
+use crate::translate::plan::{BitSet, ColumnMask, ColumnUsedMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
     function::{AggFunc, Deterministic, Func},
@@ -97,10 +97,9 @@ mod without_rowid_scan;
 #[derive(Debug, Default)]
 pub(crate) struct AvailableIndexes {
     indexes_by_table_id: HashMap<TableInternalId, VecDeque<Arc<Index>>>,
-    /// Whether the statement is an UPDATE of a WITHOUT ROWID table. SQLite's
-    /// whereLoopAddBtree then takes no index of the table for one that holds
-    /// every column the loop reads, since the loop has no SELECT.
-    updates_without_rowid_table: bool,
+    /// The columns that the WHERE clause of an UPDATE of a WITHOUT ROWID
+    /// table reads, which SQLite's whereLoopAddBtree costs its indexes by.
+    update_where_columns: Option<ColumnUsedMask>,
 }
 
 impl AvailableIndexes {
@@ -126,12 +125,12 @@ impl AvailableIndexes {
 
         Self {
             indexes_by_table_id,
-            updates_without_rowid_table: false,
+            update_where_columns: None,
         }
     }
 
-    pub(crate) fn updates_without_rowid_table(&self) -> bool {
-        self.updates_without_rowid_table
+    pub(crate) fn update_where_columns(&self) -> Option<&ColumnUsedMask> {
+        self.update_where_columns.as_ref()
     }
 
     pub(crate) fn indexes_for_table(
@@ -1630,8 +1629,20 @@ fn optimize_update_plan(
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     let mut available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
-    available_indexes.updates_without_rowid_table =
-        plan.target_table.btree().is_some_and(|table| !table.has_rowid);
+    if plan.target_table.btree().is_some_and(|table| !table.has_rowid) {
+        let mut where_columns = ColumnUsedMask::default();
+        for term in &plan.where_clause {
+            walk_expr(&term.expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+                if let ast::Expr::Column { table, column, .. } = expr {
+                    if *table == plan.target_table.internal_id {
+                        where_columns.set(*column)?;
+                    }
+                }
+                Ok(WalkControl::Continue)
+            })?;
+        }
+        available_indexes.update_where_columns = Some(where_columns);
+    }
     rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,
