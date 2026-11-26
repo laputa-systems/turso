@@ -11446,6 +11446,17 @@ pub fn op_function(
                     let column_def = connection
                         .dialect()
                         .parse_internal_column_definition(column_def)?;
+                    let quoting = match alter_func {
+                        AlterTableFunc::RenameColumn => {
+                            match state.registers[*start_reg + 8].get_value() {
+                                Value::Text(quoted) if quoted.as_str() == "1" => {
+                                    RenameQuoting::Always
+                                }
+                                _ => RenameQuoting::WhereQuoted,
+                            }
+                        }
+                        _ => RenameQuoting::of_column(&column_def.col_name),
+                    };
 
                     let _rename_to = normalize_ident(column_def.col_name.as_str());
 
@@ -11529,7 +11540,7 @@ pub fn op_function(
                                     sql.as_str(),
                                     &new_stmt,
                                     rendered,
-                                    RenameQuoting::of_column(&column_def.col_name),
+                                    quoting,
                                 )?)
                             }
                             ast::Stmt::CreateTable {
@@ -11715,7 +11726,7 @@ pub fn op_function(
                                             sql.as_str(),
                                             &new_stmt,
                                             rendered,
-                                            RenameQuoting::of_column(&column_def.col_name),
+                                            quoting,
                                         )?
                                     }
                                     _ => rendered,

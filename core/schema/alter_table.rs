@@ -177,7 +177,14 @@ mod rename_column_view {
             }))
         })();
         visiting_views.remove(&current_view_name);
-        rewrite_result
+        rewrite_result.map_err(|error| match error {
+            LimboError::ParseError(message) if message.starts_with("no such column: ") => {
+                LimboError::ParseError(format!(
+                    "error in view {current_view_name} after rename: {message}"
+                ))
+            }
+            error => error,
+        })
     }
 
     fn apply_view_column_rename(
@@ -370,6 +377,18 @@ mod rename_column_view {
 
         if let Some(ref sources) = scope_sources {
             for sorted_col in &mut select.order_by {
+                if select.body.compounds.is_empty() {
+                    match order_by_output_column(&select.body.select, &sorted_col.expr, sources, ctx)
+                    {
+                        Some(OrderByOutputColumn::Alias) => continue,
+                        Some(OrderByOutputColumn::RenamedByStar(name)) => {
+                            return Err(LimboError::ParseError(format!(
+                                "no such column: {name}"
+                            )));
+                        }
+                        None => {}
+                    }
+                }
                 rewrite_expr_in_scope(
                     &mut sorted_col.expr,
                     sources,
@@ -402,6 +421,59 @@ mod rename_column_view {
         }
 
         Ok(changed)
+    }
+
+    enum OrderByOutputColumn {
+        /// The term names a result column by its `AS` alias.
+        Alias,
+        /// The term names a result column that a `*` gives with the name of
+        /// the renamed column, which it loses.
+        RenamedByStar(String),
+    }
+
+    /// What an ORDER BY term of a simple SELECT names when SQLite resolves
+    /// it as the name of a result column (`resolveAsName`) rather than as a
+    /// column of a table: a rename leaves such a term as written.
+    fn order_by_output_column(
+        one_select: &ast::OneSelect,
+        term: &ast::Expr,
+        sources: &[ViewSourceInfo],
+        ctx: &ViewRewriteCtx,
+    ) -> Option<OrderByOutputColumn> {
+        let (ast::Expr::Id(name) | ast::Expr::Name(name)) = term else {
+            return None;
+        };
+        if one_select_has_explicit_alias(one_select, name.as_str()) {
+            return Some(OrderByOutputColumn::Alias);
+        }
+        if !name.as_str().eq_ignore_ascii_case(ctx.old_column) {
+            return None;
+        }
+        let ast::OneSelect::Select { columns, .. } = one_select else {
+            return None;
+        };
+        let renamed_source = |source: &ViewSourceInfo| {
+            source.is_target_table && source.columns_before.contains(&ctx.old_column_norm)
+        };
+        let star_gives_column = columns.iter().any(|column| match column {
+            ast::ResultColumn::Star => sources.iter().any(renamed_source),
+            ast::ResultColumn::TableStar(qualifier) => {
+                let qualifier = normalize_ident(qualifier.as_str());
+                sources
+                    .iter()
+                    .any(|source| source.matches_qualifier(&qualifier) && renamed_source(source))
+            }
+            ast::ResultColumn::Expr(..) => false,
+        });
+        if !star_gives_column {
+            return None;
+        }
+        // A name that only changes case still names the result column.
+        Some(if ctx.new_column.eq_ignore_ascii_case(ctx.old_column) {
+            OrderByOutputColumn::Alias
+        } else {
+            OrderByOutputColumn::RenamedByStar(name.as_str().to_string())
+        })
     }
 
     fn rewrite_one_select_for_column_rename(
