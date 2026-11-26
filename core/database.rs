@@ -908,7 +908,31 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Data
         if matches!(registry.get(key), Some(RegistryEntry::Ready(weak)) if weak.strong_count() == 0)
         {
             registry.remove(key);
+            if self.opts.enable_rollback_journal && !self.open_flags.contains(OpenFlags::ReadOnly) {
+                remove_empty_wal_file(self.io.as_ref(), &self.shared_wal, &self.wal_path);
+            }
         }
+    }
+}
+
+fn remove_empty_wal_file(io: &dyn IO, shared_wal: &RwLock<WalFileShared>, wal_path: &str) {
+    let shared_wal = shared_wal.read();
+    if !shared_wal.metadata.enabled.load(Ordering::Acquire)
+        || shared_wal.metadata.max_frame.load(Ordering::Acquire) != 0
+    {
+        return;
+    }
+    let Some(file) = shared_wal.runtime.file.as_ref() else {
+        return;
+    };
+    match file.size() {
+        Ok(0) => {
+            if let Err(err) = io.remove_file(wal_path) {
+                tracing::warn!("failed to remove the empty WAL file '{wal_path}': {err}");
+            }
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!("failed to read the size of the WAL file '{wal_path}': {err}"),
     }
 }
 

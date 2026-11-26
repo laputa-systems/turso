@@ -205,6 +205,17 @@ fn files_in(dir: &Path) -> BTreeMap<String, Vec<u8>> {
         .collect()
 }
 
+fn assert_same_files(after: &BTreeMap<String, Vec<u8>>, before: &BTreeMap<String, Vec<u8>>) {
+    assert_eq!(
+        after.keys().collect::<Vec<_>>(),
+        before.keys().collect::<Vec<_>>(),
+        "the set of files changed"
+    );
+    for (name, bytes) in after {
+        assert!(bytes == &before[name], "{name} changed");
+    }
+}
+
 fn sidecar(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{suffix}", db_path.display()))
 }
@@ -238,7 +249,7 @@ fn legacy_database_is_read_without_changing_any_file() {
     assert_eq!(single(&conn, "PRAGMA journal_mode"), "t:delete");
     close(db, conn);
 
-    assert_eq!(files_in(dir.path()), before);
+    assert_same_files(&files_in(dir.path()), &before);
 }
 
 #[test]
@@ -633,6 +644,38 @@ fn new_database_becomes_wal_when_asked_before_the_first_write() {
     assert_eq!(sqlite.integrity, "ok");
     assert_eq!(sqlite.journal_mode, "wal");
     assert_eq!(sqlite.dump, expected);
+}
+
+#[test]
+fn open_pragmas_succeed_and_leave_unwritten_files_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let rollback_path = dir.path().join("rollback.db");
+    python(PY_CREATE_LEGACY, &[&rollback_path]);
+    let wal_path = dir.path().join("wal.db");
+    python(
+        "con = sqlite3.connect(sys.argv[1], isolation_level=None)\npopulate(con)\ncon.execute('PRAGMA journal_mode=WAL')\ncon.close()\n",
+        &[&wal_path],
+    );
+    let before = files_in(dir.path());
+    assert!(!before.contains_key("wal.db-wal"));
+
+    for (db_path, journal_mode) in [(&rollback_path, "TRUNCATE"), (&wal_path, "WAL")] {
+        let (db, conn) = open(db_path);
+        rows(&conn, "PRAGMA page_size=4096");
+        rows(&conn, "PRAGMA synchronous=OFF");
+        rows(&conn, "PRAGMA synchronous=NORMAL");
+        assert_eq!(
+            single(&conn, &format!("PRAGMA journal_mode={journal_mode}")),
+            format!("t:{}", journal_mode.to_lowercase())
+        );
+        rows(&conn, "PRAGMA cache_size=128");
+        rows(&conn, "PRAGMA mmap_size=268435456");
+        rows(&conn, "PRAGMA mmap_size");
+        assert_eq!(single(&conn, "SELECT count(*) FROM visits"), "i:600");
+        close(db, conn);
+    }
+
+    assert_same_files(&files_in(dir.path()), &before);
 }
 
 #[test]
