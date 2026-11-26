@@ -114,6 +114,22 @@ impl Dialect for IcuDialect {
         self.inner.format_rewritten_table_sql(stmt)
     }
 
+    fn format_index_sql(&self, input: &str, canonical: String) -> Result<String> {
+        self.inner.format_index_sql(input, canonical)
+    }
+
+    fn format_trigger_sql(&self, input: &str, canonical: String) -> Result<String> {
+        self.inner.format_trigger_sql(input, canonical)
+    }
+
+    fn added_column_text(&self, input: &str) -> Option<String> {
+        self.inner.added_column_text(input)
+    }
+
+    fn table_sql_with_added_column(&self, sql: &str, column: &str) -> Option<String> {
+        self.inner.table_sql_with_added_column(sql, column)
+    }
+
     fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder> {
         self.inner.schema_builder(enable_custom_types)
     }
