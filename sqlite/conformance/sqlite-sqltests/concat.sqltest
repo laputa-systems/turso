@@ -77,9 +77,8 @@ expect {
     'a-c-1-2.5'
 }
 
-# SQLite inserts the separator only when the result already has content. An
-# empty argument is still concatenated, so an empty one after content gets a
-# separator of its own.
+# SQLite skips only the NULL arguments. An empty argument, even the first one,
+# is joined with a separator like any other.
 test concat-ws-empty-arguments {
     SELECT quote(concat_ws(',', '', 'a'));
     SELECT quote(concat_ws(',', 'a', '', 'b'));
@@ -93,15 +92,15 @@ test concat-ws-empty-arguments {
     SELECT quote(concat_ws(',', 'a', x'', 'b'));
 }
 expect {
-    'a'
+    ',a'
     'a,,b'
-    'a'
-    'a'
+    ',a'
+    ',,a'
     'a,,'
     'a'
+    ','
     ''
-    ''
-    'a'
+    ',a'
     'a,,b'
 }
 
