@@ -1858,3 +1858,60 @@ fn the_catalog_gets_a_new_schema_and_a_dropped_schema() {
         ["create schema app", "drop schema app"]
     );
 }
+
+#[test]
+fn icu_functions_replace_upper_lower_like_and_regexp() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let sqlite: Arc<dyn Dialect> = Arc::new(SqliteDialect);
+    let db = open_db(&io, "dialect-icu.db", sqlite.with_icu_functions()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    let rows = conn
+        .prepare(
+            "SELECT upper('straße'), lower('ΣΑΣ'), upper('i', 'tr_TR'), 'Ä' LIKE 'ä', \
+             like('a\\%', 'a%', '\\'), 'abc' REGEXP 'b', 'abc' REGEXP 'a.c', 'Ä' GLOB 'ä'",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::build_text("STRASSE"),
+            Value::build_text("σας"),
+            Value::build_text("İ"),
+            Value::from_i64(1),
+            Value::from_i64(1),
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(0),
+        ]]
+    );
+    conn.close().unwrap();
+}
+
+#[test]
+fn the_sqlite_dialect_keeps_its_ascii_upper_lower_and_like() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_db(&io, "dialect-no-icu.db", Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+
+    let rows = conn
+        .prepare("SELECT upper('straße'), 'Ä' LIKE 'ä', 'a' LIKE 'A'")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::build_text("STRAßE"),
+            Value::from_i64(0),
+            Value::from_i64(1),
+        ]]
+    );
+    conn.close().unwrap();
+}
