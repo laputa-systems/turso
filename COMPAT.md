@@ -153,7 +153,7 @@ change when they are converted to text.
 | WITH clause               | ✅ Yes     | Includes WITH RECURSIVE.           |
 | WINDOW functions             | 🚧 Partial | Aggregate functions, `row_number`, `rank`, `dense_rank`, `first_value`, `last_value`, and `nth_value` work with the default frame. Missing: `percent_rank`, `cume_dist`, `ntile`, `lag`, and `lead`. Custom frame specs (`ROWS`/`RANGE`/`GROUPS BETWEEN`, `EXCLUDE`) are not yet supported. |
 | GENERATED                 | 🚧 Partial      | virtual columns only (partial affinity support). |
-| WITHOUT ROWID             | 🚧 Partial | Requires `--experimental-without-rowid`. Effectively **insert-only**: CREATE / INSERT / SELECT work (incl. composite PK), but UPDATE, DELETE, UPSERT, `INSERT OR REPLACE`, secondary UNIQUE constraints, secondary `CREATE INDEX`, `FOREIGN KEY`, CDC, and materialized views are all rejected. AUTOINCREMENT and missing PK rejection are parity with SQLite. |
+| WITHOUT ROWID             | 🚧 Partial | Requires `--experimental-without-rowid`. CREATE, INSERT (with `OR REPLACE` and the other conflict clauses), UPDATE, DELETE, SELECT, secondary `CREATE INDEX` and secondary UNIQUE constraints work, and indexes have SQLite's layout. UPSERT, RETURNING on UPDATE and DELETE, triggers on UPDATE and DELETE, `FOREIGN KEY`, CDC, and materialized views are rejected. AUTOINCREMENT and missing PK rejection are parity with SQLite. |
 | CREATE TRIGGER ... INSTEAD OF | ❌ No  | Triggers on views are not supported. Currently errors with misleading "no such table" message. |
 | CREATE VIEW IF NOT EXISTS | 🚧 Partial | Not idempotent — second create on an existing view errors instead of no-op. |
 

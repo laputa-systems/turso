@@ -49,7 +49,6 @@ REINDEX NOCASE;
 REINDEX returns an error in the following cases:
 
 - When the connection is in MVCC mode (`journal_mode=mvcc`).
-- On `WITHOUT ROWID` tables.
 - For custom index methods that have no backing B-tree, such as FTS and vector indexes.
 - When `PRAGMA query_only` is enabled.
 

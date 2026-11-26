@@ -64,6 +64,20 @@ expect {
     k|2
 }
 
+test without-rowid-reindex {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
+    CREATE INDEX idx_t_b ON t(b);
+    INSERT INTO t VALUES ('k', 2), ('m', 1);
+    REINDEX idx_t_b;
+    SELECT * FROM t INDEXED BY idx_t_b;
+    PRAGMA integrity_check;
+}
+expect {
+    m|1
+    k|2
+    ok
+}
+
 test without-rowid-update {
     CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
     INSERT INTO t VALUES ('k', 1);

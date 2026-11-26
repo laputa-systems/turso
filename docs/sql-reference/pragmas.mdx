@@ -186,7 +186,7 @@ PRAGMA index_info(index-name);
 
 An expression column (for example `CREATE INDEX i ON t(lower(name))`) has `cid` -2 and a NULL `name`.
 
-The PRIMARY KEY of a `WITHOUT ROWID` table is reported as an index named `sqlite_autoindex_<table>_1`. Passing the table's name to `index_info` or `index_xinfo` also describes that index.
+The PRIMARY KEY of a `WITHOUT ROWID` table is reported as an index named `sqlite_autoindex_<table>_<N>`, where `N` is the number SQLite gives it among the PRIMARY KEY and UNIQUE constraints of the table. Passing the table's name to `index_info` or `index_xinfo` also describes that index. Each entry of another index of a `WITHOUT ROWID` table ends with the PRIMARY KEY columns that its key does not hold: `index_xinfo` lists them with `key` 0, and `index_info` does not list them.
 
 ### index_xinfo
 

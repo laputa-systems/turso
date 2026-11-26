@@ -748,8 +748,6 @@ pub(crate) fn emit_program_for_update(
     )?;
     program.preassign_label_to_next_insn(after_main_loop_label);
 
-    // The second pass reads the row through the table cursor, which the
-    // primary key positions, not through the index the first pass scanned.
     table_references.joined_tables_mut()[0].op = Operation::Scan(Scan::BTreeTable {
         iter_dir: IterationDirection::Forwards,
         index: None,
