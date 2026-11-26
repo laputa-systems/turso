@@ -1,12 +1,9 @@
-# Known tursopg gaps against PostgreSQL: float4 and float8
-#
-# See errors.sqltest for how a gap test reads. These tests write text and
-# numbers to float4 and float8 columns and read them back, without a cast.
-# A test without `@compat-gap` already matches PostgreSQL.
+# float4 and float8: reading text, keeping NaN, infinity and negative zero,
+# range errors, and the order of floats. A value is written as text or as a
+# number to a column of the type, without a cast.
 
 @database :memory:
 
-@compat-gap "type:float8"
 test float8-keeps-nan {
     CREATE TABLE t (id int, x float8);
     INSERT INTO t VALUES (1, 'NaN'), (2, 'nan'), (3, ' NaN ');
@@ -17,12 +14,7 @@ expect {
     2|NaN|f
     3|NaN|f
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
-@compat-gap "type:float8"
 test float8-reads-infinity {
     CREATE TABLE t (id int, x float8);
     INSERT INTO t VALUES (1, 'Infinity'), (2, 'inf'), (3, '-inf'), (4, '+Infinity'), (5, '-Infinity');
@@ -35,12 +27,7 @@ expect {
     4|Infinity
     5|-Infinity
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
-@compat-gap "type:float8"
 test float8-keeps-negative-zero {
     CREATE TABLE t (id int, x float8);
     INSERT INTO t VALUES (1, '-0'), (2, 0);
@@ -50,12 +37,7 @@ expect {
     1|-0
     2|0
 }
-expect @tursopg {
-    1|0
-    2|0
-}
 
-@compat-gap "type:float8"
 test float8-reads-exponents-and-spaces {
     CREATE TABLE t (id int, x float8);
     INSERT INTO t VALUES (1, '1e3'), (2, '  1.5  ');
@@ -65,12 +47,7 @@ expect {
     1|1000
     2|1.5
 }
-expect @tursopg {
-    1|1000.0
-    2|1.5
-}
 
-@compat-gap "type:float4"
 test float4-keeps-nan-infinity-and-negative-zero {
     CREATE TABLE t (id int, x float4);
     INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-0');
@@ -81,14 +58,9 @@ expect {
     2|Infinity
     3|-0
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
 # A float4 has about 7 digits. The text that it reads back has the fewest
 # digits that give the same float4.
-@compat-gap "type:float4"
 test float4-keeps-seven-digits {
     CREATE TABLE t (id int, x float4);
     INSERT INTO t VALUES (1, 0.1), (2, 16777217), (3, 123456789), (4, '3.4028235e38'), (5, 1e-45);
@@ -101,15 +73,7 @@ expect {
     4|3.4028235e+38
     5|1e-45
 }
-expect @tursopg {
-    1|0.1
-    2|16777217.0
-    3|123456789.0
-    4|3.4028235e38
-    5|1e-45
-}
 
-@compat-gap "type:float4"
 test float4-is-less-exact-than-float8 {
     CREATE TABLE t (a float4, b float8);
     INSERT INTO t VALUES (0.1, 0.1);
@@ -118,11 +82,7 @@ test float4-is-less-exact-than-float8 {
 expect {
     0.1|0.1|f|t|f
 }
-expect @tursopg {
-    0.1|0.1|t|f|f
-}
 
-@compat-gap "type:float4"
 test float4-refuses-a-number-out-of-range {
     CREATE TABLE t (x float4);
     INSERT INTO t VALUES ('1e39');
@@ -131,10 +91,7 @@ test float4-refuses-a-number-out-of-range {
 expect error {
     "1e39" is out of range for type real
 }
-expect @tursopg {
-}
 
-@compat-gap "type:float8"
 test float8-refuses-a-number-out-of-range {
     CREATE TABLE t (x float8);
     INSERT INTO t VALUES ('1e400');
@@ -143,10 +100,7 @@ test float8-refuses-a-number-out-of-range {
 expect error {
     "1e400" is out of range for type double precision
 }
-expect @tursopg {
-}
 
-@compat-gap "type:float8"
 test float8-refuses-a-number-that-is-too-small {
     CREATE TABLE t (x float8);
     INSERT INTO t VALUES ('1e-400');
@@ -155,10 +109,7 @@ test float8-refuses-a-number-that-is-too-small {
 expect error {
     "1e-400" is out of range for type double precision
 }
-expect @tursopg {
-}
 
-@compat-gap "type:float8"
 test float8-refuses-text-that-is-not-a-number {
     CREATE TABLE t (x float8);
     INSERT INTO t VALUES ('abc');
@@ -167,12 +118,7 @@ test float8-refuses-text-that-is-not-a-number {
 expect error {
     invalid input syntax for type double precision: "abc"
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
-@compat-gap "type:float4"
 test float4-refuses-text-that-is-not-a-number {
     CREATE TABLE t (x float4);
     INSERT INTO t VALUES ('abc');
@@ -181,12 +127,7 @@ test float4-refuses-text-that-is-not-a-number {
 expect error {
     invalid input syntax for type real: "abc"
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
-@compat-gap "type:float8"
 test float8-refuses-empty-text {
     CREATE TABLE t (x float8);
     INSERT INTO t VALUES ('');
@@ -195,17 +136,12 @@ test float8-refuses-empty-text {
 expect error {
     invalid input syntax for type double precision: ""
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
 setup float8_table {
     CREATE TABLE t (id int, x float8);
 }
 
 @setup float8_table
-@compat-gap "type:float8"
 test float8-sorts-nan-after-every-number {
     INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
     SELECT x FROM t ORDER BY x;
@@ -218,13 +154,8 @@ expect {
     NaN
     NaN
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
 @setup float8_table
-@compat-gap "type:float8"
 test float8-sorts-nan-first-in-descending-order {
     INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
     SELECT x FROM t ORDER BY x DESC;
@@ -237,13 +168,8 @@ expect {
     -2.5
     -Infinity
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
 @setup float8_table
-@compat-gap "type:float8"
 test float8-nan-equals-nan {
     INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
     SELECT id FROM t WHERE x = x ORDER BY id;
@@ -256,13 +182,8 @@ expect {
     5
     6
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
 @setup float8_table
-@compat-gap "type:float8"
 test float8-nan-is-greater-than-infinity {
     INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
     SELECT id FROM t WHERE x > 'Infinity' ORDER BY id;
@@ -271,13 +192,8 @@ expect {
     1
     6
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
 @setup float8_table
-@compat-gap "type:float8"
 test float8-everything-else-is-less-than-nan {
     INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
     SELECT id FROM t WHERE x < 'NaN' ORDER BY id;
@@ -288,13 +204,8 @@ expect {
     4
     5
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
 @setup float8_table
-@compat-gap "type:float8"
 test float8-distinct-merges-nans {
     INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
     SELECT count(*) FROM (SELECT DISTINCT x FROM t) d;
@@ -302,13 +213,8 @@ test float8-distinct-merges-nans {
 expect {
     5
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
 @setup float8_table
-@compat-gap "type:float8"
 test float8-group-by-merges-nans {
     INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
     SELECT x, count(*) FROM t GROUP BY x ORDER BY x;
@@ -320,13 +226,8 @@ expect {
     Infinity|1
     NaN|2
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
 @setup float8_table
-@compat-gap "type:float8"
 test float8-max-is-nan {
     INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
     SELECT max(x), min(x) FROM t;
@@ -334,23 +235,14 @@ test float8-max-is-nan {
 expect {
     NaN|-Infinity
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
-}
 
 @setup float8_table
-@compat-gap "type:float8"
 test float8-join-matches-nan-with-nan {
     INSERT INTO t VALUES (1, 'NaN'), (2, 'Infinity'), (3, '-Infinity'), (4, 1.5), (5, -2.5), (6, 'NaN');
     SELECT a.id, b.id FROM t a JOIN t b ON a.x = b.x WHERE a.id < b.id ORDER BY 1, 2;
 }
 expect {
     1|6
-}
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
 }
 
 setup zeros {
@@ -396,7 +288,6 @@ expect {
 }
 
 @setup zeros
-@compat-gap "type:float8"
 test float8-sorts-zeros-as-equal {
     SELECT x, id FROM t WHERE id IN (1, 2) ORDER BY x, id;
 }
@@ -404,12 +295,7 @@ expect {
     -0|1
     0|2
 }
-expect @tursopg {
-    0|1
-    0|2
-}
 
-@compat-gap "type:float8"
 test float8-unique-index-refuses-a-second-nan {
     CREATE TABLE t (x float8 UNIQUE);
     INSERT INTO t VALUES ('NaN');
@@ -418,10 +304,6 @@ test float8-unique-index-refuses-a-second-nan {
 @sqlstate 23505
 expect error {
     duplicate key value violates unique constraint "t_x_key"
-}
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
 }
 
 test float8-unique-index-refuses-zero-after-negative-zero {
@@ -434,7 +316,6 @@ expect error {
     duplicate key value violates unique constraint "t_x_key"
 }
 
-@compat-gap "type:float8"
 test float8-index-orders-nan-last {
     CREATE TABLE t (x float8);
     CREATE INDEX t_x ON t (x);
@@ -448,7 +329,14 @@ expect {
     Infinity
     NaN
 }
-@sqlstate 23000
-expect @tursopg error {
-    cannot store TEXT value in REAL column t.x
+
+# 1e23 is exactly halfway to the float below it, which PostgreSQL does not
+# take as the shortest text.
+test float8-writes-a-number-halfway-to-the-next-float-with-more-digits {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('1e23');
+    SELECT x FROM t;
+}
+expect {
+    9.999999999999999e+22
 }

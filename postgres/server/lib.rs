@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, StatementTimes, Value, WallClockInstant};
 use turso_pg::{
-    parse_pg_bool, split_statements, sql_parse_error, sqlstate_error, PgConnection,
+    parse_pg_bool, read_pg_float, split_statements, sql_parse_error, sqlstate_error, PgConnection,
     StatementResultKind, TransactionState,
 };
 use turso_pg_parser::cmdtag::CommandTag;
@@ -652,6 +652,7 @@ enum BinaryEncoding {
     Bool,
     Int4,
     Int8,
+    Float4,
     Float8,
     Bytea,
 }
@@ -664,6 +665,7 @@ impl BinaryEncoding {
             Type::BOOL => Some(Self::Bool),
             Type::INT4 => Some(Self::Int4),
             Type::INT8 => Some(Self::Int8),
+            Type::FLOAT4 => Some(Self::Float4),
             Type::FLOAT8 => Some(Self::Float8),
             Type::BYTEA => Some(Self::Bytea),
             _ => None,
@@ -912,6 +914,7 @@ fn binary_parameter_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResul
             BinaryEncoding::Bool
             | BinaryEncoding::Int4
             | BinaryEncoding::Int8
+            | BinaryEncoding::Float4
             | BinaryEncoding::Float8,
         )
         | None => Err(binary_not_supported(&format!("parameter ${n}"), pg_type)),
@@ -937,7 +940,17 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             })?;
             Ok(Value::from_i64(i))
         }
-        Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
+        Type::FLOAT4 | Type::FLOAT8 => {
+            let number = read_pg_float(text, *pg_type == Type::FLOAT4)
+                .map_err(|error| wire_error(error.sqlstate, error.message))?;
+            // A number of core cannot be a NaN, and the float types read the text.
+            Ok(if number.is_nan() {
+                Value::build_text("NaN")
+            } else {
+                Value::from_f64(number)
+            })
+        }
+        Type::NUMERIC => {
             let f: f64 = text.parse().map_err(|e| {
                 PgWireError::UserError(Box::new(error_info(&format!(
                     "invalid float parameter: {e}"
@@ -1055,7 +1068,7 @@ fn encode_binary(
     text_type: turso_pg::TextType,
 ) -> turso_core::Result<()> {
     use turso_core::Numeric::{Float, Integer};
-    use BinaryEncoding::{Bool, Bytea, Float8, Int4, Int8, Text};
+    use BinaryEncoding::{Bool, Bytea, Float4, Float8, Int4, Int8, Text};
     let encoding = BinaryEncoding::of(pg_type)
         .expect("build_field_info refuses binary format for a type without a binary encoding");
     let written = match (encoding, val) {
@@ -1069,11 +1082,15 @@ fn encode_binary(
         (Int8, Value::Numeric(Integer(i))) => encoder.encode_field(i),
         (Float8, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f64)),
         (Float8, Value::Numeric(Float(f))) => encoder.encode_field(&f64::from(*f)),
+        (Float4, Value::Numeric(Integer(i))) => encoder.encode_field(&(*i as f32)),
+        (Float4, Value::Numeric(Float(f))) => encoder.encode_field(&(f64::from(*f) as f32)),
+        (Float8, Value::Text(text)) if text.as_str() == "NaN" => encoder.encode_field(&f64::NAN),
+        (Float4, Value::Text(text)) if text.as_str() == "NaN" => encoder.encode_field(&f32::NAN),
         (Bytea, Value::Blob(b)) => encoder.encode_field(&b.as_slice()),
         (Bool | Int4 | Int8, Value::Numeric(Float(_)))
         | (Bytea, Value::Numeric(_))
-        | (Bool | Int4 | Int8 | Float8 | Bytea, Value::Text(_))
-        | (Bool | Int4 | Int8 | Float8, Value::Blob(_)) => {
+        | (Bool | Int4 | Int8 | Float4 | Float8 | Bytea, Value::Text(_))
+        | (Bool | Int4 | Int8 | Float4 | Float8, Value::Blob(_)) => {
             return Err(binary_value_not_supported(pg_type))
         }
     };
@@ -1094,8 +1111,10 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     match upper.as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
-        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
-        | "DECIMAL" => Type::FLOAT8,
+        "FLOAT4" => Type::FLOAT4,
+        "REAL" | "FLOAT" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC" | "DECIMAL" => {
+            Type::FLOAT8
+        }
         "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
         "BOOLEAN" | "BOOL" => Type::BOOL,
