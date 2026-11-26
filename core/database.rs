@@ -40,7 +40,9 @@ use crate::{
         page_cache::PageCache,
         page_transform::PageTransform,
         pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut, SharedPagerState},
-        rollback_journal::{self, RollbackJournal, RollbackJournalShared},
+        rollback_journal::{
+            self, LockingMode, PlayedBackJournal, RollbackJournal, RollbackJournalShared,
+        },
         sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion, TextEncoding, Version},
     },
     sync::{
@@ -817,6 +819,8 @@ pub struct Database<
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     pub(crate) rollback_journal: ArcSwapOption<RollbackJournalShared>,
+    pub(crate) locking_mode: Arc<Mutex<LockingMode>>,
+    played_back_journal: Option<PlayedBackJournal>,
     pub(crate) open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
@@ -910,6 +914,11 @@ impl<A: alloc::ConcurrentAllocator, F: alloc::ConcurrentAllocator> Drop for Data
             registry.remove(key);
             if self.opts.enable_rollback_journal && !self.open_flags.contains(OpenFlags::ReadOnly) {
                 remove_empty_wal_file(self.io.as_ref(), &self.shared_wal, &self.wal_path);
+                if let Some(journal) = self.rollback_journal.load_full() {
+                    if let Err(err) = journal.close(self.io.as_ref()) {
+                        tracing::warn!("failed to finish the journal of '{}': {err}", self.path);
+                    }
+                }
             }
         }
     }
@@ -1006,6 +1015,8 @@ impl Database {
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
             rollback_journal: ArcSwapOption::empty(),
+            locking_mode: Arc::new(Mutex::new(LockingMode::Exclusive)),
+            played_back_journal: None,
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
             dialect,
@@ -1789,14 +1800,18 @@ impl Database {
                     } else {
                         &format!("{path}-wal")
                     };
-                    if opts.enable_rollback_journal && !is_memory_like(path) {
+                    let played_back_journal = if opts.enable_rollback_journal
+                        && !is_memory_like(path)
+                    {
                         rollback_journal::recover_hot_journal(
                             io.as_ref(),
                             db_file.as_ref(),
                             &rollback_journal::journal_path(path),
                             flags,
-                        )?;
-                    }
+                        )?
+                    } else {
+                        None
+                    };
                     let mut db = Self::new(
                         opts,
                         flags,
@@ -1812,6 +1827,7 @@ impl Database {
                         native_extensions,
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
+                    db.played_back_journal = played_back_journal;
 
                     // Header validation + WAL recovery runs as a sub state
                     // machine in the ValidatingHeader phase so it can yield
@@ -2416,10 +2432,17 @@ impl Database {
                         if !self.initialized() {
                             pager.set_initial_rollback_journal_header()?;
                         }
-                        let shared = Arc::new(RollbackJournalShared::new(&self.path));
+                        let shared = Arc::new(RollbackJournalShared::new(
+                            &self.path,
+                            self.locking_mode.clone(),
+                            self.played_back_journal.take(),
+                        ));
                         self.rollback_journal.store(Some(shared.clone()));
                         pager.set_rollback_journal(RollbackJournal::new(shared));
                         return Ok(IOResult::Done(Arc::new(*pager)));
+                    }
+                    if self.played_back_journal.take().is_some() {
+                        rollback_journal::delete_journal(self.io.as_ref(), &self.path)?;
                     }
 
                     // Now check the Header Version to see which mode the DB file really is on
@@ -2687,6 +2710,7 @@ impl Database {
         } else {
             pager.set_initial_wal_header()?;
         }
+        journal.close(self.io.as_ref())?;
         let shared_wal =
             WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, self.open_flags)?;
         let state = std::mem::replace(&mut *shared_wal.write(), WalFileShared::new_noop_state());
@@ -2725,7 +2749,11 @@ impl Database {
             ))) => {}
             Err(err) => return Err(err),
         }
-        let journal = Arc::new(RollbackJournalShared::new(&self.path));
+        let journal = Arc::new(RollbackJournalShared::new(
+            &self.path,
+            self.locking_mode.clone(),
+            None,
+        ));
         journal.set_mode(mode);
         self.rollback_journal.store(Some(journal));
         let pager = self.replace_connection_pager(connection, &pager)?;

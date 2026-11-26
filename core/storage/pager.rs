@@ -3529,7 +3529,7 @@ impl Pager {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         if let Some(journal) = self.rollback_journal.as_ref() {
-            journal.begin_write_tx()?;
+            journal.begin_write_tx(self.io.as_ref())?;
             return self.maybe_allocate_page1();
         }
         return_if_io!(self.maybe_allocate_page1());

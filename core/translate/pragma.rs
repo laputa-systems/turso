@@ -19,6 +19,7 @@ use crate::pragma::pragma_for;
 use crate::schema::{BTreeTable, Index, IndexColumn, Schema, Table, EXPR_INDEX_SENTINEL};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
+use crate::storage::rollback_journal::LockingMode;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
@@ -438,9 +439,17 @@ fn update_pragma(
                 Expr::Literal(Literal::String(s)) => s.clone(),
                 _ => parse_string(&value)?,
             };
-            if connection.db.opts.enable_rollback_journal && mode.eq_ignore_ascii_case("normal") {
+            if connection.db.opts.enable_rollback_journal {
+                let locking_mode = if mode.eq_ignore_ascii_case("normal") {
+                    LockingMode::Normal
+                } else if mode.eq_ignore_ascii_case("exclusive") {
+                    LockingMode::Exclusive
+                } else {
+                    *connection.db.locking_mode.lock()
+                };
+                *connection.db.locking_mode.lock() = locking_mode;
                 let register = program.alloc_register();
-                program.emit_string8("normal".to_string(), register);
+                program.emit_string8(locking_mode.name().to_string(), register);
                 program.emit_result_row(register, 1);
                 program.add_pragma_result_column(PragmaName::LockingMode.to_string());
                 return Ok(TransactionMode::None);
@@ -977,7 +986,12 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::LockingMode => {
-            program.emit_string8("exclusive".to_string(), register);
+            let locking_mode = if connection.db.opts.enable_rollback_journal {
+                *connection.db.locking_mode.lock()
+            } else {
+                LockingMode::Exclusive
+            };
+            program.emit_string8(locking_mode.name().to_string(), register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

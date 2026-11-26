@@ -54,12 +54,46 @@ impl RollbackJournalMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockingMode {
+    Normal,
+    Exclusive,
+}
+
+impl LockingMode {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Exclusive => "exclusive",
+        }
+    }
+}
+
+// SQLite finalizes a played-back journal with the locking mode in force at
+// the first read, which comes after the open pragmas. The journal stays hot
+// until the first write or the close instead, because a second playback over
+// the restored database changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlayedBackJournal {
+    names_super_journal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalFinalize {
+    Delete,
+    Truncate,
+    ZeroHeader,
+}
+
 pub(crate) struct RollbackJournalShared {
     path: String,
     mode: Mutex<RollbackJournalMode>,
+    locking_mode: Arc<Mutex<LockingMode>>,
     locks: Mutex<JournalLocks>,
     commit_generation: AtomicU64,
     needs_playback: AtomicBool,
+    played_back: Mutex<Option<PlayedBackJournal>>,
+    journal_opened: AtomicBool,
     retired: AtomicBool,
 }
 
@@ -70,15 +104,69 @@ struct JournalLocks {
 }
 
 impl RollbackJournalShared {
-    pub(crate) fn new(db_path: &str) -> Self {
+    pub(crate) fn new(
+        db_path: &str,
+        locking_mode: Arc<Mutex<LockingMode>>,
+        played_back: Option<PlayedBackJournal>,
+    ) -> Self {
         Self {
             path: journal_path(db_path),
             mode: Mutex::new(RollbackJournalMode::Delete),
+            locking_mode,
             locks: Mutex::new(JournalLocks::default()),
             commit_generation: AtomicU64::new(0),
             needs_playback: AtomicBool::new(false),
+            played_back: Mutex::new(played_back),
+            journal_opened: AtomicBool::new(played_back.is_some()),
             retired: AtomicBool::new(false),
         }
+    }
+
+    fn locking_mode(&self) -> LockingMode {
+        *self.locking_mode.lock()
+    }
+
+    // SQLite's pager_end_transaction: an exclusive-mode connection keeps the
+    // journal file and zeroes its header in DELETE mode, as in PERSIST mode.
+    fn finalize_after_commit(&self) -> JournalFinalize {
+        match (self.mode(), self.locking_mode()) {
+            (RollbackJournalMode::Truncate, _) => JournalFinalize::Truncate,
+            (RollbackJournalMode::Persist, _)
+            | (RollbackJournalMode::Delete, LockingMode::Exclusive) => JournalFinalize::ZeroHeader,
+            (RollbackJournalMode::Delete, LockingMode::Normal) => JournalFinalize::Delete,
+        }
+    }
+
+    // A connection plays back a hot journal on its first read, before any
+    // PRAGMA journal_mode takes effect, so the journal is finalized as in
+    // DELETE mode. SQLite's zeroJournalHdr truncates instead of zeroing when
+    // the journal names a super-journal.
+    fn finish_played_back_journal(&self, io: &dyn IO) -> Result<()> {
+        let Some(played_back) = *self.played_back.lock() else {
+            return Ok(());
+        };
+        let finalize = match self.locking_mode() {
+            LockingMode::Normal => JournalFinalize::Delete,
+            LockingMode::Exclusive if played_back.names_super_journal => JournalFinalize::Truncate,
+            LockingMode::Exclusive => JournalFinalize::ZeroHeader,
+        };
+        finalize_journal_blocking(io, &self.path, finalize, SyncMode::Full)?;
+        *self.played_back.lock() = None;
+        Ok(())
+    }
+
+    // SQLite's sqlite3PagerClose leaves exclusive mode before it ends the
+    // last transaction, so a DELETE-mode journal that an exclusive-mode
+    // connection kept is deleted at close.
+    pub(crate) fn close(&self, io: &dyn IO) -> Result<()> {
+        self.finish_played_back_journal(io)?;
+        if self.mode() == RollbackJournalMode::Delete
+            && self.locking_mode() == LockingMode::Exclusive
+            && self.journal_opened.load(Ordering::Acquire)
+        {
+            finalize_journal_blocking(io, &self.path, JournalFinalize::Delete, SyncMode::Off)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn mode(&self) -> RollbackJournalMode {
@@ -94,7 +182,8 @@ impl RollbackJournalShared {
     }
 
     fn play_back_failed_commit(&self, io: &dyn IO, db_file: &dyn DatabaseStorage) -> Result<()> {
-        roll_back_journal(io, db_file, &self.path, self.mode())?;
+        play_back_and_sync(io, db_file, &self.path)?;
+        finalize_journal_blocking(io, &self.path, self.finalize_after_commit(), SyncMode::Full)?;
         self.needs_playback.store(false, Ordering::Release);
         self.commit_generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
@@ -173,7 +262,16 @@ impl RollbackJournal {
         Ok(self.seen_generation.swap(generation, Ordering::AcqRel) != generation)
     }
 
-    pub(crate) fn begin_write_tx(&self) -> Result<()> {
+    pub(crate) fn begin_write_tx(&self, io: &dyn IO) -> Result<()> {
+        self.take_write_lock()?;
+        if let Err(err) = self.shared.finish_played_back_journal(io) {
+            self.end_write_tx();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn take_write_lock(&self) -> Result<()> {
         let mut held = self.held.lock();
         match *held {
             HeldLock::Write => return Ok(()),
@@ -261,7 +359,7 @@ impl RollbackJournal {
         }
         if let Some(journal) = commit.journal {
             drop(journal);
-            finalize_journal_blocking(io, &self.shared.path, self.shared.mode())?;
+            finalize_journal_blocking(io, &self.shared.path, commit.finalize, commit.sync_mode)?;
         }
         Ok(())
     }
@@ -300,7 +398,7 @@ enum CommitStep {
 struct JournalCommit {
     step: CommitStep,
     pending: Option<Completion>,
-    mode: RollbackJournalMode,
+    finalize: JournalFinalize,
     sync_mode: SyncMode,
     sync_type: FileSyncType,
     page_size: usize,
@@ -348,7 +446,7 @@ impl JournalCommit {
         Ok(Self {
             step: CommitStep::ReadOriginals,
             pending: None,
-            mode: shared.mode(),
+            finalize: shared.finalize_after_commit(),
             sync_mode,
             sync_type: pager.get_sync_type(),
             page_size,
@@ -457,6 +555,7 @@ impl JournalCommit {
                 journal
             }
         };
+        shared.journal_opened.store(true, Ordering::Release);
         let stale = journal.size()? > 0;
         self.journal = Some(journal.clone());
         if !stale {
@@ -524,17 +623,17 @@ impl JournalCommit {
         pager: &Pager,
         shared: &RollbackJournalShared,
     ) -> Result<Option<Completion>> {
-        match self.mode {
-            RollbackJournalMode::Truncate => Ok(Some(
+        match self.finalize {
+            JournalFinalize::Truncate => Ok(Some(
                 self.journal()
                     .truncate(0, Completion::new_trunc(|_| {}))?,
             )),
-            RollbackJournalMode::Persist => Ok(Some(self.journal().pwrite(
+            JournalFinalize::ZeroHeader => Ok(Some(self.journal().pwrite(
                 0,
                 Arc::new(Buffer::new(vec![0u8; JOURNAL_HEADER_FIELDS_LEN])),
                 Completion::new_write(|_| {}),
             )?)),
-            RollbackJournalMode::Delete => {
+            JournalFinalize::Delete => {
                 self.journal = None;
                 pager.io.remove_file(&shared.path)?;
                 Ok(None)
@@ -543,12 +642,11 @@ impl JournalCommit {
     }
 
     fn sync_finalized_journal(&mut self) -> Result<Option<Completion>> {
-        let sync = match self.mode {
-            RollbackJournalMode::Truncate => self.sync_mode == SyncMode::Full,
-            RollbackJournalMode::Persist => self.sync_mode != SyncMode::Off,
-            RollbackJournalMode::Delete => false,
+        let completion = if finalize_needs_sync(self.finalize, self.sync_mode) {
+            Some(self.sync_journal()?)
+        } else {
+            None
         };
-        let completion = if sync { Some(self.sync_journal()?) } else { None };
         Ok(completion)
     }
 }
@@ -602,13 +700,13 @@ pub(crate) fn recover_hot_journal(
     db_file: &dyn DatabaseStorage,
     journal_path: &str,
     open_flags: OpenFlags,
-) -> Result<()> {
+) -> Result<Option<PlayedBackJournal>> {
     let read_only = open_flags.contains(OpenFlags::ReadOnly);
     let Some(journal) = open_existing(io, journal_path, OpenFlags::ReadOnly)? else {
-        return Ok(());
+        return Ok(None);
     };
     if journal.size()? == 0 {
-        return Ok(());
+        return Ok(None);
     }
     if db_file.size()? == 0 {
         // SQLite deletes a journal next to an empty database: the journal
@@ -618,11 +716,11 @@ pub(crate) fn recover_hot_journal(
         if !read_only {
             io.remove_file(journal_path)?;
         }
-        return Ok(());
+        return Ok(None);
     }
     let first = read_exact(io, journal.as_ref(), 0, 1)?;
     if first.is_none_or(|byte| byte[0] == 0) {
-        return Ok(());
+        return Ok(None);
     }
     if read_only {
         return Err(LimboError::InvalidArgument(format!(
@@ -630,57 +728,84 @@ pub(crate) fn recover_hot_journal(
         )));
     }
     drop(journal);
-    roll_back_journal(io, db_file, journal_path, RollbackJournalMode::Delete)
+    play_back_and_sync(io, db_file, journal_path).map(Some)
 }
 
-fn roll_back_journal(
+pub(crate) fn delete_journal(io: &dyn IO, db_path: &str) -> Result<()> {
+    finalize_journal_blocking(io, &journal_path(db_path), JournalFinalize::Delete, SyncMode::Off)
+}
+
+fn play_back_and_sync(
     io: &dyn IO,
     db_file: &dyn DatabaseStorage,
     journal_path: &str,
-    mode: RollbackJournalMode,
-) -> Result<()> {
+) -> Result<PlayedBackJournal> {
     let Some(journal) = open_existing(io, journal_path, OpenFlags::NoLock)? else {
-        return Ok(());
+        return Ok(PlayedBackJournal {
+            names_super_journal: false,
+        });
     };
     wait(io, journal.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?)?;
-    if super_journal_committed(io, journal.as_ref())? {
+    let super_journal = super_journal_name(io, journal.as_ref())?;
+    let committed_elsewhere = match super_journal.as_deref() {
+        Some(name) => open_existing(io, name, OpenFlags::ReadOnly)?.is_none(),
+        None => false,
+    };
+    if committed_elsewhere {
         tracing::debug!("journal '{journal_path}' belongs to a committed multi-database transaction");
     } else {
         play_back(io, db_file, journal.as_ref())?;
     }
     wait(io, db_file.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?)?;
-    drop(journal);
-    finalize_journal_blocking(io, journal_path, mode)
+    Ok(PlayedBackJournal {
+        names_super_journal: super_journal.is_some(),
+    })
 }
 
-fn finalize_journal_blocking(io: &dyn IO, journal_path: &str, mode: RollbackJournalMode) -> Result<()> {
-    match mode {
-        RollbackJournalMode::Delete => match io.remove_file(journal_path) {
-            Ok(()) => Ok(()),
-            Err(err) if is_not_found(&err) => Ok(()),
-            Err(err) => Err(err),
-        },
-        RollbackJournalMode::Truncate => {
+fn finalize_journal_blocking(
+    io: &dyn IO,
+    journal_path: &str,
+    finalize: JournalFinalize,
+    sync_mode: SyncMode,
+) -> Result<()> {
+    let journal = match finalize {
+        JournalFinalize::Delete => {
+            return match io.remove_file(journal_path) {
+                Ok(()) => Ok(()),
+                Err(err) if is_not_found(&err) => Ok(()),
+                Err(err) => Err(err),
+            };
+        }
+        JournalFinalize::Truncate | JournalFinalize::ZeroHeader => {
             let Some(journal) = open_existing(io, journal_path, OpenFlags::NoLock)? else {
                 return Ok(());
             };
-            wait(io, journal.truncate(0, Completion::new_trunc(|_| {}))?)?;
-            wait(io, journal.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?)
+            journal
         }
-        RollbackJournalMode::Persist => {
-            let Some(journal) = open_existing(io, journal_path, OpenFlags::NoLock)? else {
-                return Ok(());
-            };
-            wait(
-                io,
-                journal.pwrite(
-                    0,
-                    Arc::new(Buffer::new(vec![0u8; JOURNAL_HEADER_FIELDS_LEN])),
-                    Completion::new_write(|_| {}),
-                )?,
-            )?;
-            wait(io, journal.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?)
-        }
+    };
+    let completion = if finalize == JournalFinalize::Truncate {
+        journal.truncate(0, Completion::new_trunc(|_| {}))?
+    } else {
+        journal.pwrite(
+            0,
+            Arc::new(Buffer::new(vec![0u8; JOURNAL_HEADER_FIELDS_LEN])),
+            Completion::new_write(|_| {}),
+        )?
+    };
+    wait(io, completion)?;
+    if finalize_needs_sync(finalize, sync_mode) {
+        wait(io, journal.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?)?;
+    }
+    Ok(())
+}
+
+// SQLite syncs a truncated journal only with synchronous=FULL, and a zeroed
+// journal header unless synchronous=OFF.
+fn finalize_needs_sync(finalize: JournalFinalize, sync_mode: SyncMode) -> bool {
+    match finalize {
+        JournalFinalize::Truncate => sync_mode == SyncMode::Full,
+        JournalFinalize::ZeroHeader => sync_mode != SyncMode::Off,
+        JournalFinalize::Delete => false,
     }
 }
 
@@ -817,10 +942,10 @@ fn database_page_size(io: &dyn IO, db_file: &dyn DatabaseStorage) -> Result<u32>
 // A journal ends with the name of a super-journal when its transaction
 // spanned several databases. That transaction committed when the
 // super-journal is gone, and then SQLite does not play the journal back.
-fn super_journal_committed(io: &dyn IO, journal: &dyn File) -> Result<bool> {
+fn super_journal_name(io: &dyn IO, journal: &dyn File) -> Result<Option<String>> {
     let size = journal.size()?;
     if size < SUPER_JOURNAL_TRAILER_LEN {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(trailer) = read_exact(
         io,
@@ -829,14 +954,14 @@ fn super_journal_committed(io: &dyn IO, journal: &dyn File) -> Result<bool> {
         SUPER_JOURNAL_TRAILER_LEN as usize,
     )?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if trailer[8..] != JOURNAL_MAGIC {
-        return Ok(false);
+        return Ok(None);
     }
     let name_len = be_u32(&trailer[..4]) as u64;
     if name_len == 0 || name_len > size - SUPER_JOURNAL_TRAILER_LEN {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(name) = read_exact(
         io,
@@ -845,22 +970,19 @@ fn super_journal_committed(io: &dyn IO, journal: &dyn File) -> Result<bool> {
         name_len as usize,
     )?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let checksum = name
         .iter()
         .fold(be_u32(&trailer[4..8]), |sum, byte| sum.wrapping_sub(*byte as u32));
     if checksum != 0 {
-        return Ok(false);
+        return Ok(None);
     }
     let name_end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
-    let Ok(super_path) = std::str::from_utf8(&name[..name_end]) else {
-        return Ok(false);
-    };
-    if super_path.is_empty() {
-        return Ok(false);
+    match std::str::from_utf8(&name[..name_end]) {
+        Ok(path) if !path.is_empty() => Ok(Some(path.to_string())),
+        _ => Ok(None),
     }
-    Ok(open_existing(io, super_path, OpenFlags::ReadOnly)?.is_none())
 }
 
 fn open_existing(io: &dyn IO, path: &str, flags: OpenFlags) -> Result<Option<Arc<dyn File>>> {

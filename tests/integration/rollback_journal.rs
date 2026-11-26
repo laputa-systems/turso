@@ -92,7 +92,23 @@ if pid == 0:
 os.waitpid(pid, 0)
 "#;
 
+const PY_OPEN_THEN_CLOSE: &str = r#"
+con = sqlite3.connect(sys.argv[1], isolation_level=None)
+for pragma in sys.argv[3:]:
+    con.execute(pragma).fetchall()
+dump(con)
+if sys.argv[2]:
+    con.execute(sys.argv[2])
+print(dump(con))
+con.close()
+"#;
+
 fn python(script: &str, args: &[&Path]) -> String {
+    let args: Vec<&std::ffi::OsStr> = args.iter().map(|path| path.as_os_str()).collect();
+    python_with_args(script, &args)
+}
+
+fn python_with_args(script: &str, args: &[&std::ffi::OsStr]) -> String {
     let output = Command::new("python3")
         .arg("-I")
         .arg("-c")
@@ -360,6 +376,75 @@ fn hot_journal_left_by_sqlite_is_rolled_back() {
     let after_turso = sqlite_view(&turso_copy);
     assert_eq!(after_turso.integrity, "ok");
     assert_eq!(after_turso.dump, pre_transaction.dump);
+}
+
+#[test]
+fn played_back_journal_is_finished_as_sqlite_finishes_it_in_each_locking_mode() {
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("source.db");
+    python(PY_CRASH_WITH_HOT_JOURNAL, &[&source, dir.path()]);
+    let crash_db = dir.path().join("crash.db");
+    let insert = "INSERT INTO users VALUES(5000, 'after recovery', 'after@example.com')";
+    let cases = [
+        ("exclusive", Some("TRUNCATE"), None),
+        ("exclusive", Some("TRUNCATE"), Some(insert)),
+        ("exclusive", None, None),
+        ("exclusive", None, Some(insert)),
+        ("normal", Some("TRUNCATE"), None),
+        ("normal", Some("TRUNCATE"), Some(insert)),
+        ("normal", None, Some(insert)),
+    ];
+    for (round, (locking_mode, journal_mode, write)) in cases.into_iter().enumerate() {
+        let case = format!("{locking_mode} {journal_mode:?} {write:?}");
+        let copy = |engine: &str| {
+            let copy_dir = dir.path().join(format!("{engine}-{round}"));
+            std::fs::create_dir(&copy_dir).unwrap();
+            let db = copy_dir.join("crash.db");
+            std::fs::copy(&crash_db, &db).unwrap();
+            std::fs::copy(sidecar(&crash_db, "-journal"), sidecar(&db, "-journal")).unwrap();
+            db
+        };
+        let sqlite_db = copy("sqlite");
+        let turso_db = copy("turso");
+
+        let mut pragmas = vec![format!("PRAGMA locking_mode={locking_mode}")];
+        if let Some(journal_mode) = journal_mode {
+            pragmas.push(format!("PRAGMA journal_mode={journal_mode}"));
+        }
+        let mut args: Vec<&std::ffi::OsStr> =
+            vec![sqlite_db.as_os_str(), std::ffi::OsStr::new(write.unwrap_or(""))];
+        args.extend(pragmas.iter().map(std::ffi::OsStr::new));
+        let sqlite_dump = python_with_args(PY_OPEN_THEN_CLOSE, &args);
+
+        let (db, conn) = open(&turso_db);
+        if locking_mode == "normal" {
+            assert_eq!(single(&conn, "PRAGMA locking_mode=NORMAL"), "t:normal");
+        }
+        assert_eq!(single(&conn, "PRAGMA locking_mode"), format!("t:{locking_mode}"));
+        if let Some(journal_mode) = journal_mode {
+            rows(&conn, &format!("PRAGMA journal_mode={journal_mode}"));
+        }
+        turso_dump(&conn);
+        if let Some(write) = write {
+            conn.execute(write).unwrap();
+        }
+        let turso_dump = turso_dump(&conn);
+        close(db, conn);
+
+        assert_eq!(turso_dump, sqlite_dump.trim_end_matches('\n'), "{case}");
+        let journal_state = |db: &Path| std::fs::read(sidecar(db, "-journal")).ok();
+        let sqlite_journal = journal_state(&sqlite_db);
+        let turso_journal = journal_state(&turso_db);
+        assert_eq!(
+            turso_journal.as_ref().map(Vec::len),
+            sqlite_journal.as_ref().map(Vec::len),
+            "{case}: journal size"
+        );
+        if write.is_none() {
+            assert!(turso_journal == sqlite_journal, "{case}: journal bytes");
+        }
+        assert_eq!(sqlite_view(&turso_db).integrity, "ok", "{case}");
+    }
 }
 
 struct Snapshot {
