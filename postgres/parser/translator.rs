@@ -7327,7 +7327,8 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "XML" | "TSVECTOR" | "TSQUERY" => "TEXT".into(),
         "MONEY" => "REAL".into(),
         "BIT" | "VARBIT" => "TEXT".into(),
-        "OID" | "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
+        "OID" => "oid".into(),
+        "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
         | "REGCONFIG" | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
         "VOID" => "TEXT".into(),
 
@@ -7909,7 +7910,7 @@ fn pg_type_name_to_ast_type(
     let pg_type = supported_type_name(type_name)?;
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" | "OID"
+        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL"
         | "REGCLASS" | "REGTYPE" => "INTEGER",
         // Casts like INTEGER; the name types the result as int8.
         "BIGINT" | "INT8" | "BIGSERIAL" => "BIGINT",
@@ -7919,6 +7920,7 @@ fn pg_type_name_to_ast_type(
         // The frontend registers these types, so the cast names the type
         // and converts the value as a column of the type does.
         "BOOLEAN" | "BOOL" => "boolean",
+        "OID" => "oid",
         "DATE" => "date",
         "TIME" => "time",
         "TIMESTAMP" => "timestamp",

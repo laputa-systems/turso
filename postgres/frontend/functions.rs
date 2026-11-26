@@ -2537,16 +2537,17 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 ))
             }
         }
-        "oid" => {
-            if trimmed.parse::<u32>().is_ok() {
-                None
-            } else {
-                Some((
-                    format!("invalid input syntax for type oid: \"{input}\""),
-                    "22P02".to_string(),
-                ))
-            }
-        }
+        "oid" => match crate::pg_type::parse_pg_oid(input) {
+            Ok(_) => None,
+            Err(crate::pg_type::OidInputError::InvalidSyntax) => Some((
+                format!("invalid input syntax for type oid: \"{input}\""),
+                "22P02".to_string(),
+            )),
+            Err(crate::pg_type::OidInputError::OutOfRange) => Some((
+                format!("value \"{input}\" is out of range for type oid"),
+                "22003".to_string(),
+            )),
+        },
         _ => Some((
             format!("type \"{type_name}\" does not exist"),
             "42704".to_string(),
