@@ -3509,9 +3509,9 @@ impl Schema {
                     // maps to `Some(INVALID_DB_ID)` until a connection-scoped
                     // reparse runs with a real resolver.
                     self.handle_schema_row(
-                        &ty,
-                        &name,
-                        &table_name,
+                        ty.as_str(),
+                        name.as_str(),
+                        table_name.as_str(),
                         root_page,
                         sql,
                         syms,

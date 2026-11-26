@@ -1131,11 +1131,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            let val = read_text(data)?;
-            Ok((
-                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
-                content_size,
-            ))
+            Ok((ValueRef::Text(read_text(data)), content_size))
         }
     }
 }
@@ -1258,11 +1254,7 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                let val = read_text(data)?;
-                Ok((
-                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
-                    content_size,
-                ))
+                Ok((ValueRef::Text(read_text(data)), content_size))
             }
             _ => unreachable!(),
         },
@@ -1273,12 +1265,11 @@ pub fn read_value_serial_type<'a>(
     }
 }
 
+/// The TEXT value whose bytes are `payload`. SQLite does not check that a
+/// TEXT is UTF-8, so the bytes can be any bytes.
 #[inline(always)]
-pub fn read_text(payload: &[u8]) -> Result<&str> {
-    crate::types::validate_utf8(payload).ok_or_else(|| {
-        mark_unlikely();
-        LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-    })
+pub fn read_text(payload: &[u8]) -> TextRef<'_> {
+    TextRef::from_bytes(payload, TextSubtype::Text)
 }
 
 #[inline(always)]
@@ -2478,33 +2469,29 @@ mod tests {
                 .described_as(format!("payload {payload:?}"))
                 .is_equal_to(payload.iter().all(u8::is_ascii));
 
-            let expected = std::str::from_utf8(&payload);
-            match (read_text(&payload), expected) {
-                (Ok(got), Ok(want)) => {
-                    assert_that!(got)
-                        .described_as(format!("payload {payload:?}"))
-                        .is_equal_to(want);
-                }
-                (Err(LimboError::Corrupt(_)), Err(_)) => {}
-                (got, want) => panic!("payload {payload:?}: got {got:?}, std says {want:?}"),
-            }
+            let text = read_text(&payload);
+            assert_that!(text.as_bytes())
+                .described_as(format!("payload {payload:?}"))
+                .is_equal_to(payload.as_slice());
+            assert_that!(text.to_str())
+                .described_as(format!("payload {payload:?}"))
+                .is_equal_to(std::str::from_utf8(&payload).ok());
         }
     }
 
     #[test]
-    fn test_text_decoders_reject_invalid_utf8() {
+    fn test_text_decoders_keep_invalid_utf8() {
         for result in [
             read_value(&[0xff], SerialType::text(1)),
             read_value_serial_type(&[0xff], 15),
         ] {
-            assert!(
-                matches!(
-                    result,
-                    Err(LimboError::Corrupt(ref message))
-                        if message == "TEXT value contains invalid UTF-8"
-                ),
-                "unexpected result: {result:?}"
-            );
+            match result {
+                Ok((ValueRef::Text(text), 1)) => {
+                    assert_eq!(text.as_bytes(), &[0xff]);
+                    assert_eq!(text.to_str(), None);
+                }
+                other => panic!("unexpected result: {other:?}"),
+            }
         }
     }
 

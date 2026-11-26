@@ -310,6 +310,10 @@ impl Dialect for IcuDialect {
         self.inner.errors_on_zero_divisor()
     }
 
+    fn concatenation_of_blobs_is_blob(&self) -> bool {
+        self.inner.concatenation_of_blobs_is_blob()
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         self.inner.mod_of_integers_is_integer()
     }
@@ -394,7 +398,7 @@ const CASE_MAPPER: CaseMapperBorrowed<'static> = CaseMapper::new();
 fn value_text(value: &Value) -> Option<Cow<'_, [u8]>> {
     Some(match value {
         Value::Null => return None,
-        Value::Text(text) => Cow::Borrowed(text.as_str().as_bytes()),
+        Value::Text(text) => Cow::Borrowed(text.as_bytes()),
         Value::Blob(blob) => Cow::Borrowed(blob.as_slice()),
         Value::Numeric(Numeric::Integer(integer)) => Cow::Owned(integer.to_string().into_bytes()),
         Value::Numeric(Numeric::Float(float)) => {

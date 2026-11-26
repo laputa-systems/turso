@@ -24,13 +24,12 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
-use std::borrow::{Borrow, Cow};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::iter::{FusedIterator, Peekable};
-use std::ops::Deref;
 use std::task::{Poll, Waker};
 
 mod builtin;
@@ -165,11 +164,34 @@ impl TryFrom<i64> for TextSubtype {
     }
 }
 
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// The `split` of a [Text] or a [TextRef] whose bytes are UTF-8.
+const UTF8_SPLIT: u32 = u32::MAX;
+
+/// The value of a TEXT. SQLite does not check that TEXT is UTF-8: a TEXT
+/// holds the bytes that were written, for example by `CAST(x'fffe' AS TEXT)`
+/// or by `sqlite3_bind_text`. [Text::as_bytes] gives these bytes.
+/// [Text::as_str] gives them as a `str` when they are UTF-8, else their
+/// lossy rendition, as `String::from_utf8_lossy` makes it.
+#[derive(Clone)]
 pub struct Text {
-    pub value: Cow<'static, str>,
+    /// The bytes of the text. When they are not UTF-8, the buffer is owned and
+    /// holds the lossy rendition of the bytes after them.
+    value: Cow<'static, [u8]>,
+    /// [UTF8_SPLIT] when `value` is UTF-8, else the number of bytes of the
+    /// text at the start of `value`.
+    split: u32,
     pub subtype: TextSubtype,
+}
+
+impl Debug for Text {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("Text");
+        match self.to_str() {
+            Some(text) => debug.field("value", &text),
+            None => debug.field("bytes", &self.as_bytes()),
+        };
+        debug.field("subtype", &self.subtype).finish()
+    }
 }
 
 impl Display for Text {
@@ -180,47 +202,283 @@ impl Display for Text {
 
 impl Text {
     pub fn new(value: impl Into<Cow<'static, str>>) -> Self {
-        Self {
-            value: value.into(),
-            subtype: TextSubtype::Text,
-        }
+        Self::utf8(value.into(), TextSubtype::Text)
     }
+
     #[cfg(feature = "json")]
     pub fn json(value: String) -> Self {
+        Self::utf8(Cow::Owned(value), TextSubtype::Json)
+    }
+
+    fn utf8(value: Cow<'static, str>, subtype: TextSubtype) -> Self {
+        let value = match value {
+            Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
+            Cow::Owned(text) => Cow::Owned(text.into_bytes()),
+        };
         Self {
-            value: value.into(),
-            subtype: TextSubtype::Json,
+            value,
+            split: UTF8_SPLIT,
+            subtype,
         }
     }
 
+    /// A TEXT of any bytes.
+    pub fn from_bytes(bytes: impl Into<Cow<'static, [u8]>>) -> Self {
+        let mut text = Self {
+            value: bytes.into(),
+            split: UTF8_SPLIT,
+            subtype: TextSubtype::Text,
+        };
+        text.check_utf8();
+        text
+    }
+
+    /// The bytes of the text.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        if self.split == UTF8_SPLIT {
+            &self.value
+        } else {
+            &self.value[..self.split as usize]
+        }
+    }
+
+    /// The bytes of the text when they are UTF-8, else their lossy rendition,
+    /// with U+FFFD in place of each sequence that is not UTF-8.
+    #[inline]
     pub fn as_str(&self) -> &str {
-        &self.value
+        let text = if self.split == UTF8_SPLIT {
+            &self.value[..]
+        } else {
+            &self.value[self.split as usize..]
+        };
+        // SAFETY: `value` is UTF-8 when `split` is UTF8_SPLIT, and the bytes
+        // after `split` are a lossy rendition, which is UTF-8.
+        unsafe { std::str::from_utf8_unchecked(text) }
+    }
+
+    /// The text when its bytes are UTF-8.
+    #[inline]
+    pub fn to_str(&self) -> Option<&str> {
+        if self.split == UTF8_SPLIT {
+            // SAFETY: `value` is UTF-8 when `split` is UTF8_SPLIT.
+            Some(unsafe { std::str::from_utf8_unchecked(&self.value) })
+        } else {
+            None
+        }
+    }
+
+    /// Whether the bytes of the text are UTF-8.
+    #[inline]
+    pub fn is_utf8(&self) -> bool {
+        self.split == UTF8_SPLIT
+    }
+
+    /// The bytes of the text.
+    pub fn into_bytes(self) -> std::vec::Vec<u8> {
+        if self.split == UTF8_SPLIT {
+            self.value.into_owned()
+        } else {
+            let mut bytes = self.value.into_owned();
+            bytes.truncate(self.split as usize);
+            bytes
+        }
+    }
+
+    /// Takes the owned buffer of the text, which becomes empty. None for a
+    /// text whose buffer is borrowed.
+    pub(crate) fn take_buffer(&mut self) -> Option<std::vec::Vec<u8>> {
+        let Cow::Owned(buffer) = &mut self.value else {
+            return None;
+        };
+        let buffer = std::mem::take(buffer);
+        self.split = UTF8_SPLIT;
+        Some(buffer)
+    }
+
+    /// The buffer and the `split` of the text, for a copy of the text.
+    #[inline(always)]
+    fn parts(&self) -> (&[u8], u32) {
+        (&self.value, self.split)
+    }
+
+    /// Sets `split` for the bytes in `value`, which hold no lossy rendition
+    /// yet, and adds the rendition after bytes that are not UTF-8.
+    #[inline(always)]
+    fn check_utf8(&mut self) {
+        if validate_utf8(&self.value).is_some() {
+            self.split = UTF8_SPLIT;
+        } else {
+            self.add_lossy_rendition();
+        }
+    }
+
+    /// Adds the lossy rendition after the bytes in `value`, which are not
+    /// UTF-8 and hold no rendition yet.
+    #[cold]
+    #[inline(never)]
+    fn add_lossy_rendition(&mut self) {
+        let split = non_utf8_split(self.value.len());
+        let bytes = self.value.to_mut();
+        let rendition = match String::from_utf8_lossy(bytes) {
+            Cow::Owned(rendition) => rendition,
+            Cow::Borrowed(_) => unreachable!("the bytes are not UTF-8"),
+        };
+        bytes.extend_from_slice(rendition.as_bytes());
+        self.split = split;
+    }
+
+    /// The owned buffer of the text, cleared, with room for `needed` bytes. An
+    /// allocation failure leaves the text as it was.
+    #[inline(always)]
+    fn cleared_buffer(
+        &mut self,
+        needed: usize,
+    ) -> std::result::Result<&mut std::vec::Vec<u8>, TryReserveError> {
+        match &mut self.value {
+            Cow::Owned(buffer) if buffer.capacity() >= needed => {}
+            Cow::Owned(buffer) => buffer.try_reserve(needed - buffer.len())?,
+            Cow::Borrowed(_) => {
+                let mut buffer = std::vec::Vec::new();
+                buffer.try_reserve(needed)?;
+                self.value = Cow::Owned(buffer);
+            }
+        }
+        self.split = UTF8_SPLIT;
+        let Cow::Owned(buffer) = &mut self.value else {
+            unreachable!("the buffer was made owned")
+        };
+        buffer.clear();
+        Ok(buffer)
+    }
+
+    /// Replaces the text with a copy of `source`, in the same buffer when the
+    /// buffer is large enough. An allocation failure leaves the text as it was.
+    fn try_copy_from(&mut self, source: &Text) -> std::result::Result<(), TryReserveError> {
+        let (bytes, split) = source.parts();
+        self.cleared_buffer(bytes.len())?.extend_from_slice(bytes);
+        self.split = split;
+        self.subtype = source.subtype;
+        Ok(())
+    }
+
+    /// A copy of the text in a new buffer.
+    fn try_copy(&self) -> std::result::Result<Text, TryReserveError> {
+        let mut text = Text {
+            value: Cow::Borrowed(&[]),
+            split: UTF8_SPLIT,
+            subtype: self.subtype,
+        };
+        text.try_copy_from(self)?;
+        Ok(text)
     }
 
     /// Replaces the text with `lhs` followed by `rhs`, in the same buffer
     /// when the buffer is large enough. The subtype becomes TEXT, as for
     /// [Text::new]. An allocation failure leaves the text as it was.
-    pub(crate) fn replace_with_concat(&mut self, lhs: &str, rhs: &str) -> Result<()> {
-        let needed = lhs.len() + rhs.len();
+    pub(crate) fn replace_with_concat(&mut self, lhs: &[u8], rhs: &[u8]) -> Result<()> {
+        let buffer = self.cleared_buffer(lhs.len() + rhs.len())?;
+        buffer.extend_from_slice(lhs);
+        buffer.extend_from_slice(rhs);
+        self.check_utf8();
+        self.subtype = TextSubtype::Text;
+        Ok(())
+    }
+
+    /// Adds `bytes` at the end of the text. The subtype becomes TEXT.
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        self.try_push_bytes(bytes)
+            .expect("memory for the bytes added to a TEXT");
+    }
+
+    /// Adds `bytes` at the end of the text. The subtype becomes TEXT. An
+    /// allocation failure leaves the text as it was.
+    pub(crate) fn try_push_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> std::result::Result<(), TryReserveError> {
+        let was_utf8 = self.split == UTF8_SPLIT;
+        let len = self.as_bytes().len();
+        let needed = len + bytes.len();
         match &mut self.value {
-            Cow::Owned(string) => {
-                if string.capacity() < needed {
-                    string.try_reserve(needed - string.len())?;
-                }
-                string.clear();
-                string.push_str(lhs);
-                string.push_str(rhs);
+            Cow::Owned(buffer) => {
+                buffer.try_reserve(needed.saturating_sub(buffer.len()))?;
+                buffer.truncate(len);
             }
-            Cow::Borrowed(_) => {
-                let mut string = String::new();
-                string.try_reserve(needed)?;
-                string.push_str(lhs);
-                string.push_str(rhs);
-                self.value = Cow::Owned(string);
+            Cow::Borrowed(old) => {
+                let mut buffer = std::vec::Vec::new();
+                buffer.try_reserve(needed)?;
+                buffer.extend_from_slice(&old[..len]);
+                self.value = Cow::Owned(buffer);
             }
+        }
+        let Cow::Owned(buffer) = &mut self.value else {
+            unreachable!("the buffer was made owned")
+        };
+        buffer.extend_from_slice(bytes);
+        self.split = UTF8_SPLIT;
+        if !was_utf8 || validate_utf8(bytes).is_none() {
+            self.check_utf8();
         }
         self.subtype = TextSubtype::Text;
         Ok(())
+    }
+
+    /// Removes the first `len` bytes of the text.
+    pub(crate) fn remove_prefix(&mut self, len: usize) {
+        let text_len = self.as_bytes().len();
+        let buffer = self.value.to_mut();
+        buffer.truncate(text_len);
+        buffer.drain(..len.min(text_len));
+        self.check_utf8();
+    }
+}
+
+#[cfg(feature = "serde")]
+mod text_serde {
+    use super::{Text, TextSubtype};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::borrow::Cow;
+
+    /// The value of a [Text] as serde writes it: a string when it is UTF-8.
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum TextValue<'a> {
+        Str(Cow<'a, str>),
+        Bytes(Cow<'a, [u8]>),
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct SerializedText<'a> {
+        #[serde(borrow)]
+        value: TextValue<'a>,
+        subtype: TextSubtype,
+    }
+
+    impl Serialize for Text {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let value = match self.to_str() {
+                Some(text) => TextValue::Str(Cow::Borrowed(text)),
+                None => TextValue::Bytes(Cow::Borrowed(self.as_bytes())),
+            };
+            SerializedText {
+                value,
+                subtype: self.subtype,
+            }
+            .serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Text {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let serialized = SerializedText::deserialize(deserializer)?;
+            let mut text = match serialized.value {
+                TextValue::Str(text) => Text::new(text.into_owned()),
+                TextValue::Bytes(bytes) => Text::from_bytes(bytes.into_owned()),
+            };
+            text.subtype = serialized.subtype;
+            Ok(text)
+        }
     }
 }
 
@@ -273,37 +531,131 @@ pub(crate) fn is_ascii(data: &[u8]) -> bool {
     data.first().is_none_or(u8::is_ascii)
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A borrowed [Text].
+#[derive(Clone, Copy)]
 pub struct TextRef<'a> {
-    pub value: &'a str,
+    /// The bytes of the text. When they are not UTF-8 and the text is borrowed
+    /// from a [Text], their lossy rendition follows them.
+    value: &'a [u8],
+    /// [UTF8_SPLIT] when `value` is UTF-8, else the number of bytes of the
+    /// text at the start of `value`.
+    split: u32,
     pub subtype: TextSubtype,
+}
+
+impl Debug for TextRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("TextRef");
+        match self.to_str() {
+            Some(text) => debug.field("value", &text),
+            None => debug.field("bytes", &self.as_bytes()),
+        };
+        debug.field("subtype", &self.subtype).finish()
+    }
 }
 
 impl<'a> TextRef<'a> {
     pub fn new(value: &'a str, subtype: TextSubtype) -> Self {
-        Self { value, subtype }
+        Self {
+            value: value.as_bytes(),
+            split: UTF8_SPLIT,
+            subtype,
+        }
     }
 
+    /// A TEXT of any bytes, as a record holds them.
+    #[inline(always)]
+    pub fn from_bytes(value: &'a [u8], subtype: TextSubtype) -> Self {
+        let split = if validate_utf8(value).is_some() {
+            UTF8_SPLIT
+        } else {
+            non_utf8_split(value.len())
+        };
+        Self {
+            value,
+            split,
+            subtype,
+        }
+    }
+
+    /// The bytes of the text.
+    #[inline]
+    pub fn as_bytes(&self) -> &'a [u8] {
+        if self.split == UTF8_SPLIT {
+            self.value
+        } else {
+            &self.value[..self.split as usize]
+        }
+    }
+
+    /// The bytes of the text when they are UTF-8. Else the lossy rendition of
+    /// a text borrowed from a [Text], and the longest UTF-8 prefix of the
+    /// bytes of a text borrowed from a record.
     #[inline]
     pub fn as_str(&self) -> &'a str {
-        self.value
+        if self.split == UTF8_SPLIT {
+            // SAFETY: `value` is UTF-8 when `split` is UTF8_SPLIT.
+            return unsafe { std::str::from_utf8_unchecked(self.value) };
+        }
+        self.non_utf8_str()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn non_utf8_str(&self) -> &'a str {
+        let split = self.split as usize;
+        if split < self.value.len() {
+            // SAFETY: the bytes after `split` are the lossy rendition of a Text,
+            // which is UTF-8.
+            return unsafe { std::str::from_utf8_unchecked(&self.value[split..]) };
+        }
+        let bytes = &self.value[..split];
+        let valid = std::str::from_utf8(bytes).map_or_else(|error| error.valid_up_to(), str::len);
+        // SAFETY: `from_utf8` found that the first `valid` bytes are UTF-8.
+        unsafe { std::str::from_utf8_unchecked(&bytes[..valid]) }
+    }
+
+    /// The text when its bytes are UTF-8.
+    #[inline]
+    pub fn to_str(&self) -> Option<&'a str> {
+        if self.split == UTF8_SPLIT {
+            // SAFETY: `value` is UTF-8 when `split` is UTF8_SPLIT.
+            Some(unsafe { std::str::from_utf8_unchecked(self.value) })
+        } else {
+            None
+        }
+    }
+
+    /// Whether the bytes of the text are UTF-8.
+    #[inline]
+    pub fn is_utf8(&self) -> bool {
+        self.split == UTF8_SPLIT
+    }
+
+    /// An owned copy of the text.
+    pub fn try_to_owned(&self) -> std::result::Result<Text, TryReserveError> {
+        let mut value = std::vec::Vec::new();
+        value.try_reserve(self.value.len())?;
+        value.extend_from_slice(self.value);
+        let mut text = Text {
+            value: Cow::Owned(value),
+            split: self.split,
+            subtype: self.subtype,
+        };
+        if self.split != UTF8_SPLIT && self.split as usize == self.value.len() {
+            text.add_lossy_rendition();
+        }
+        Ok(text)
     }
 }
 
-impl<'a> Borrow<str> for TextRef<'a> {
-    #[inline]
-    fn borrow(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl<'a> Deref for TextRef<'a> {
-    type Target = str;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
+/// The `split` of a text of `len` bytes that are not UTF-8.
+#[inline]
+fn non_utf8_split(len: usize) -> u32 {
+    u32::try_from(len)
+        .ok()
+        .filter(|&split| split != UTF8_SPLIT)
+        .expect("a TEXT that is not UTF-8 is shorter than 4 GiB")
 }
 
 pub trait Extendable<T> {
@@ -394,6 +746,8 @@ unsafe fn copy_and_fold(src: *const u8, dst: *mut u8, len: usize) -> u64 {
 }
 
 impl Text {
+    /// Replaces the text with `bytes`, as a record holds them. The subtype
+    /// becomes TEXT.
     #[inline(always)]
     pub(crate) fn replace_with_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         const FUSED_LIMIT: usize = 64;
@@ -405,40 +759,36 @@ impl Text {
             None
         };
         if let Some(is_ascii) = copied_ascii {
-            if !is_ascii {
-                simdutf8::basic::from_utf8(bytes).ok().ok_or_else(|| {
-                    mark_unlikely();
-                    LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-                })?;
-            }
-            let Cow::Owned(string) = &mut self.value else {
-                unreachable!("record bytes were copied into an owned string")
+            let Cow::Owned(buffer) = &mut self.value else {
+                unreachable!("record bytes were copied into an owned buffer")
             };
-            // SAFETY: we now know that the `len` first bytes of the string are valid UTF-8.
-            unsafe { string.as_mut_vec().set_len(len) };
+            // SAFETY: `fill_bytes` initialized the `len` first bytes of the buffer.
+            unsafe { buffer.set_len(len) };
+            self.split = UTF8_SPLIT;
+            if !is_ascii && simdutf8::basic::from_utf8(bytes).is_err() {
+                self.add_lossy_rendition();
+            }
             self.subtype = TextSubtype::Text;
         } else {
-            let text = validate_utf8(bytes).ok_or_else(|| {
-                mark_unlikely();
-                LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-            })?;
-            self.do_extend(&text)?;
+            self.do_extend(&TextRef::from_bytes(bytes, TextSubtype::Text))?;
+            if self.split != UTF8_SPLIT {
+                self.add_lossy_rendition();
+            }
         }
         return Ok(());
 
         #[inline(always)]
         fn fill_bytes(text: &mut Text, bytes: &[u8], high_bits: u64) -> Option<bool> {
             let len = bytes.len();
-            let Cow::Owned(string) = &mut text.value else {
+            let Cow::Owned(buffer) = &mut text.value else {
                 return None;
             };
-            if string.capacity() < len {
+            if buffer.capacity() < len {
                 return None;
             }
             // SAFETY: the capacity check gives `len` writable bytes, and record bytes do not overlap
-            // the buffer. Its zero length keeps invalid UTF-8 out of the String.
+            // the buffer.
             let folded = unsafe {
-                let buffer = string.as_mut_vec();
                 buffer.set_len(0);
                 copy_and_fold(bytes.as_ptr(), buffer.as_mut_ptr(), len)
             };
@@ -450,34 +800,41 @@ impl Text {
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) -> Result<()> {
-        let other_str = other.as_ref();
+        let (other_bytes, split) = other.parts();
         match &mut self.value {
-            Cow::Owned(s) => {
-                let needed = other_str.len();
-                if s.capacity() >= needed {
-                    // SAFETY: capacity >= needed, source is valid UTF-8
+            Cow::Owned(buffer) => {
+                let needed = other_bytes.len();
+                if buffer.capacity() >= needed {
+                    // SAFETY: capacity >= needed
                     turso_debug_assert!(
-                        s.as_ptr().wrapping_add(s.len()) <= other_str.as_ptr()
-                            || other_str.as_ptr().wrapping_add(other_str.len()) <= s.as_ptr(),
+                        buffer.as_ptr().wrapping_add(buffer.len()) <= other_bytes.as_ptr()
+                            || other_bytes.as_ptr().wrapping_add(other_bytes.len())
+                                <= buffer.as_ptr(),
                         "source and destination ranges must not overlap"
                     );
                     unsafe {
-                        copy_nonoverlapping_inline(other_str.as_ptr(), s.as_mut_ptr(), needed);
-                        s.as_mut_vec().set_len(needed);
+                        copy_nonoverlapping_inline(
+                            other_bytes.as_ptr(),
+                            buffer.as_mut_ptr(),
+                            needed,
+                        );
+                        buffer.set_len(needed);
                     }
                 } else {
                     // Growing the old buffer copies its bytes, which this
                     // write replaces, so copy into a new buffer instead.
                     // The capacity is the one that growing gives.
-                    let mut text = String::with_capacity(needed.max(s.capacity() * 2));
-                    text.push_str(other_str);
-                    *s = text;
+                    let mut bytes = std::vec::Vec::new();
+                    bytes.try_reserve(needed.max(buffer.capacity() * 2))?;
+                    bytes.extend_from_slice(other_bytes);
+                    *buffer = bytes;
                 }
             }
             Cow::Borrowed(_) => {
-                self.value = Cow::Owned(other_str.to_owned());
+                self.value = Cow::Owned(other_bytes.to_owned());
             }
         }
+        self.split = split;
         self.subtype = other.subtype();
         Ok(())
     }
@@ -513,17 +870,40 @@ impl<T: AnyBlob> Extendable<T> for ValueBlob {
     }
 }
 
-pub trait AnyText: AsRef<str> {
+pub trait AnyText {
+    /// The buffer and the `split` of the text, as [Text] stores them.
+    fn parts(&self) -> (&[u8], u32);
     fn subtype(&self) -> TextSubtype;
 }
 
 impl AnyText for Text {
+    #[inline(always)]
+    fn parts(&self) -> (&[u8], u32) {
+        Text::parts(self)
+    }
+
+    fn subtype(&self) -> TextSubtype {
+        self.subtype
+    }
+}
+
+impl AnyText for TextRef<'_> {
+    #[inline(always)]
+    fn parts(&self) -> (&[u8], u32) {
+        (self.value, self.split)
+    }
+
     fn subtype(&self) -> TextSubtype {
         self.subtype
     }
 }
 
 impl AnyText for &str {
+    #[inline(always)]
+    fn parts(&self) -> (&[u8], u32) {
+        (self.as_bytes(), UTF8_SPLIT)
+    }
+
     fn subtype(&self) -> TextSubtype {
         TextSubtype::Text
     }
@@ -552,33 +932,26 @@ impl AnyBlob for &[u8] {
     }
 }
 
-impl AsRef<str> for Text {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
 impl From<&str> for Text {
     fn from(value: &str) -> Self {
-        Text {
-            value: value.to_owned().into(),
-            subtype: TextSubtype::Text,
-        }
+        Text::new(value.to_owned())
     }
 }
 
 impl From<String> for Text {
     fn from(value: String) -> Self {
-        Text {
-            value: Cow::from(value),
-            subtype: TextSubtype::Text,
-        }
+        Text::new(value)
     }
 }
 
 impl From<Text> for String {
     fn from(value: Text) -> Self {
-        value.value.into_owned()
+        if value.is_utf8() {
+            // SAFETY: the bytes of the text are UTF-8.
+            unsafe { String::from_utf8_unchecked(value.into_bytes()) }
+        } else {
+            value.as_str().to_owned()
+        }
     }
 }
 
@@ -667,15 +1040,7 @@ impl TryClone for Value {
         match self {
             Self::Null => Ok(Self::Null),
             Self::Numeric(numeric) => Ok(Self::Numeric(*numeric)),
-            Self::Text(text) => {
-                let mut value = String::new();
-                value.try_reserve(text.as_str().len())?;
-                value.push_str(text.as_str());
-                Ok(Self::Text(Text {
-                    value: Cow::Owned(value),
-                    subtype: text.subtype,
-                }))
-            }
+            Self::Text(text) => Ok(Self::Text(text.try_copy()?)),
             Self::Blob(blob) => Self::from_slice(blob),
         }
     }
@@ -687,23 +1052,7 @@ impl TryClone for Value {
     #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
     fn try_clone_from(&mut self, source: &Self) -> Result<(), Self::Error> {
         match (self, source) {
-            (Self::Text(dst), Self::Text(src)) => {
-                let src_str = src.as_str();
-                match &mut dst.value {
-                    Cow::Owned(s) => {
-                        s.clear();
-                        s.try_reserve(src_str.len())?;
-                        s.push_str(src_str);
-                    }
-                    borrowed => {
-                        let mut s = String::new();
-                        s.try_reserve(src_str.len())?;
-                        s.push_str(src_str);
-                        *borrowed = Cow::Owned(s);
-                    }
-                }
-                dst.subtype = src.subtype;
-            }
+            (Self::Text(dst), Self::Text(src)) => dst.try_copy_from(src)?,
             (Self::Blob(dst), Self::Blob(src)) => {
                 dst.clear();
                 dst.try_extend(src.iter().copied())?;
@@ -821,6 +1170,7 @@ impl Value {
             Value::Numeric(n) => ValueRef::Numeric(*n),
             Value::Text(v) => ValueRef::Text(TextRef {
                 value: &v.value,
+                split: v.split,
                 subtype: v.subtype,
             }),
             Value::Blob(v) => ValueRef::Blob(v.as_slice()),
@@ -903,6 +1253,11 @@ impl Value {
         Value::Text(Text::new(text))
     }
 
+    /// A TEXT of any bytes, as `sqlite3_bind_text` takes them.
+    pub fn from_text_bytes(bytes: impl Into<Cow<'static, [u8]>>) -> Self {
+        Value::Text(Text::from_bytes(bytes))
+    }
+
     pub const fn value_type(&self) -> ValueType {
         match self {
             Value::Null => ValueType::Null,
@@ -931,7 +1286,7 @@ impl Value {
                 let fval: f64 = (*f).into();
                 out.extend_from_slice(&fval.to_be_bytes());
             }
-            Value::Text(t) => out.extend_from_slice(t.value.as_bytes()),
+            Value::Text(t) => out.extend_from_slice(t.as_bytes()),
             Value::Blob(b) => out.extend_from_slice(b),
         };
     }
@@ -949,6 +1304,17 @@ impl Value {
             Value::Null => None,
             Value::Text(text) => Some(Cow::Borrowed(text.as_str())),
             other => Some(Cow::Owned(other.non_text_to_string())),
+        }
+    }
+
+    /// The bytes of the value as text, as `sqlite3_value_text` gives them:
+    /// the bytes of a TEXT or a BLOB, and the text of a number. None for NULL.
+    pub fn cast_text_bytes(&self) -> Option<Cow<'_, [u8]>> {
+        match self {
+            Value::Null => None,
+            Value::Text(text) => Some(Cow::Borrowed(text.as_bytes())),
+            Value::Blob(blob) => Some(Cow::Borrowed(blob.as_slice())),
+            other => Some(Cow::Owned(other.non_text_to_string().into_bytes())),
         }
     }
 
@@ -1336,26 +1702,25 @@ impl std::ops::AddAssign for Value {
                 *self = sum.into();
             }
             (Self::Text(string_left), Self::Text(string_right)) => {
-                string_left.value.to_mut().push_str(&string_right.value);
-                string_left.subtype = TextSubtype::Text;
+                string_left.push_bytes(string_right.as_bytes());
             }
             (Self::Text(string_left), Self::Numeric(Numeric::Integer(int_right))) => {
                 let string_right = int_right.to_string();
-                string_left.value.to_mut().push_str(&string_right);
-                string_left.subtype = TextSubtype::Text;
+                string_left.push_bytes(string_right.as_bytes());
             }
             (Self::Numeric(Numeric::Integer(int_left)), Self::Text(string_right)) => {
-                let string_left = int_left.to_string();
-                *self = Self::build_text(string_left + string_right.as_str());
+                let mut text = Text::new(int_left.to_string());
+                text.push_bytes(string_right.as_bytes());
+                *self = Self::Text(text);
             }
             (Self::Text(string_left), Self::Numeric(Numeric::Float(_))) => {
                 let string_right = rhs.to_string();
-                string_left.value.to_mut().push_str(&string_right);
-                string_left.subtype = TextSubtype::Text;
+                string_left.push_bytes(string_right.as_bytes());
             }
             (Self::Numeric(Numeric::Float(_)), Self::Text(string_right)) => {
-                let string_left = self.to_string();
-                *self = Self::build_text(string_left + string_right.as_str());
+                let mut text = Text::new(self.to_string());
+                text.push_bytes(string_right.as_bytes());
+                *self = Self::Text(text);
             }
             (_, Self::Null) => {}
             (Self::Null, _) => *self = rhs,
@@ -1596,7 +1961,7 @@ mod immutable_record {
                 let fval: f64 = f.into();
                 out.extend_from_slice(&fval.to_be_bytes());
             }
-            ValueRef::Text(t) => out.extend_from_slice(t.value.as_bytes()),
+            ValueRef::Text(t) => out.extend_from_slice(t.as_bytes()),
             ValueRef::Blob(b) => out.extend_from_slice(b),
         }
     }
@@ -2597,10 +2962,7 @@ impl<'a> ValueRef<'a> {
         Ok(match self {
             ValueRef::Null => Value::Null,
             ValueRef::Numeric(n) => Value::from(*n),
-            ValueRef::Text(text) => Value::Text(Text {
-                value: text.value.to_string().into(),
-                subtype: text.subtype,
-            }),
+            ValueRef::Text(text) => Value::Text(text.try_to_owned()?),
             ValueRef::Blob(b) => return Value::from_slice(b),
         })
     }
@@ -2637,7 +2999,7 @@ impl<'a> PartialEq<ValueRef<'a>> for ValueRef<'a> {
             (Self::Null, Self::Null) => true,
             (Self::Numeric(a), Self::Numeric(b)) => a == b,
             (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.as_bytes() == text_right.value.as_bytes()
+                text_left.as_bytes() == text_right.as_bytes()
             }
             (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
             _ => false,
@@ -2674,7 +3036,7 @@ impl<'a> Ord for ValueRef<'a> {
             (_, Self::Numeric(_)) => std::cmp::Ordering::Greater,
 
             (Self::Text(text_left), Self::Text(text_right)) => {
-                text_left.value.as_bytes().cmp(text_right.value.as_bytes())
+                text_left.as_bytes().cmp(text_right.as_bytes())
             }
             (Self::Text(_), Self::Blob(_)) => std::cmp::Ordering::Less,
             (Self::Blob(_), Self::Text(_)) => std::cmp::Ordering::Greater,
@@ -3205,7 +3567,7 @@ where
 
     match final_comparison {
         std::cmp::Ordering::Equal => {
-            let len_cmp = lhs_text.len().cmp(&rhs_text.len());
+            let len_cmp = lhs_text.as_bytes().len().cmp(&rhs_text.as_bytes().len());
             if len_cmp != std::cmp::Ordering::Equal {
                 let adjusted = match index_info.key_info[0].sort_order {
                     SortOrder::Asc => len_cmp,
@@ -3526,7 +3888,7 @@ impl<T: AsValueRef> From<T> for SerialType {
                 _ => SerialType::i64(),
             },
             ValueRef::Numeric(Numeric::Float(_)) => SerialType::f64(),
-            ValueRef::Text(t) => SerialType::text(t.value.len() as u64),
+            ValueRef::Text(t) => SerialType::text(t.as_bytes().len() as u64),
             ValueRef::Blob(b) => SerialType::blob(b.len() as u64),
         }
     }
@@ -3624,7 +3986,7 @@ impl Record {
                 Value::Numeric(Numeric::Float(f)) => {
                     buf.extend_from_slice(&f64::from(*f).to_be_bytes())
                 }
-                Value::Text(t) => buf.extend_from_slice(t.value.as_bytes()),
+                Value::Text(t) => buf.extend_from_slice(t.as_bytes()),
                 Value::Blob(b) => buf.extend_from_slice(b),
             };
         }

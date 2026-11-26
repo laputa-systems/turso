@@ -576,6 +576,14 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether `||` of two BLOBs is a BLOB.
+    ///
+    /// PostgreSQL's `bytea || bytea` is a bytea. SQLite's `||` always gives a
+    /// TEXT, which holds the bytes of the BLOBs.
+    fn concatenation_of_blobs_is_blob(&self) -> bool {
+        false
+    }
+
     /// FIXME(pg-catalog): This hand-codes prorettype of the pg_proc entries mod(smallint, smallint), mod(integer, integer) and mod(bigint, bigint), which return their argument type. A lookup in a pg_proc table replaces this.
     /// Whether `mod` of two integers returns an integer.
     ///

@@ -41,6 +41,8 @@ const INT_HASH: u8 = 1;
 const FLOAT_HASH: u8 = 2;
 const TEXT_HASH: u8 = 3;
 const BLOB_HASH: u8 = 4;
+/// The tag of a spilled TEXT whose bytes are not UTF-8.
+const NON_UTF8_TEXT: u8 = 5;
 
 /// Hash function for join keys using rapidhash
 /// Takes collation into account when hashing text values
@@ -204,7 +206,7 @@ impl HashEntry {
         let value_size = |v: &Value| match v {
             Value::Null => 1,
             Value::Numeric(_) => 8,
-            Value::Text(t) => t.as_str().len(),
+            Value::Text(t) => t.as_bytes().len(),
             Value::Blob(b) => b.len(),
         };
         let key_size: usize = key_values.iter().map(value_size).sum();
@@ -219,7 +221,7 @@ impl HashEntry {
             Value::Null => 0,
             Value::Numeric(_) => 8,
             Value::Text(t) => {
-                let len = t.as_str().len();
+                let len = t.as_bytes().len();
                 varint_len(len as u64) + len
             }
             Value::Blob(b) => varint_len(b.len() as u64) + b.len(),
@@ -281,8 +283,8 @@ impl HashEntry {
                 buf.extend_from_slice(&f64::from(*f).to_le_bytes());
             }
             Value::Text(t) => {
-                buf.push(TEXT_HASH);
-                let bytes = t.as_str().as_bytes();
+                buf.push(if t.is_utf8() { TEXT_HASH } else { NON_UTF8_TEXT });
+                let bytes = t.as_bytes();
                 write_varint_to_vec(bytes.len() as u64, buf);
                 buf.extend_from_slice(bytes);
             }
@@ -394,6 +396,18 @@ impl HashEntry {
                 let s = unsafe { String::from_utf8_unchecked(bytes) };
                 offset += str_len as usize;
                 Value::Text(s.into())
+            }
+            NON_UTF8_TEXT => {
+                let (len, varint_len) = read_varint(&buf[offset..])?;
+                offset += varint_len;
+                if unlikely(offset + len as usize > buf.len()) {
+                    return Err(LimboError::Corrupt(
+                        "HashEntry: buffer too small for text".to_string(),
+                    ));
+                }
+                let bytes = buf[offset..offset + len as usize].to_vec();
+                offset += len as usize;
+                Value::from_text_bytes(bytes)
             }
             BLOB_HASH => {
                 let (blob_len, varint_len) = read_varint(&buf[offset..])?;

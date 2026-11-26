@@ -825,7 +825,7 @@ pub fn op_compare(
             if let (Register::Value(Value::Text(a)), Register::Value(Value::Text(b))) =
                 (&state.registers[start_reg_a], &state.registers[start_reg_b])
             {
-                let cmp = a.as_str().cmp(b.as_str());
+                let cmp = a.as_bytes().cmp(b.as_bytes());
                 state.last_compare = Some(match key_info[0].sort_order {
                     crate::ast::SortOrder::Asc => cmp,
                     crate::ast::SortOrder::Desc => cmp.reverse(),
@@ -1032,7 +1032,7 @@ macro_rules! comparison_opcode {
             ) = (&state.registers[*lhs], &state.registers[*rhs])
             {
                 if texts_compare_as_bytes(lhs_value, rhs_value, *flags, *collation) {
-                    state.pc = if comparison_matches_order($op, l.as_str().cmp(r.as_str())) {
+                    state.pc = if comparison_matches_order($op, l.as_bytes().cmp(r.as_bytes())) {
                         target_pc
                     } else {
                         state.pc + 1
@@ -2414,27 +2414,20 @@ fn op_column_fetch_overflowing(
             reg.set_blob(cursor.take_kept_values(old_blob))?;
             return Ok(InsnFunctionStepResult::Step);
         }
-        // A TEXT value moves in the same way. The `String` of a TEXT value
+        // A TEXT value moves in the same way. The buffer of a TEXT value
         // uses the global allocator. In nightly builds, the buffer of the
         // cursor uses the Turso allocator, so there the bytes are copied.
         #[cfg(not(nightly))]
         {
             let is_text = serial_type >= 13 && serial_type & 1 == 1;
-            if is_text
-                && bytes.len() as u64 == (serial_type - 13) / 2
-                && crate::types::validate_utf8(bytes).is_some()
-            {
+            if is_text && bytes.len() as u64 == (serial_type - 13) / 2 {
                 let reg = &mut state.registers[dest + i];
                 let old_text = match reg {
-                    Register::Value(Value::Text(Text {
-                        value: std::borrow::Cow::Owned(text),
-                        ..
-                    })) => std::mem::take(text).into_bytes(),
+                    Register::Value(Value::Text(text)) => text.take_buffer().unwrap_or_default(),
                     _ => crate::alloc::vec![],
                 };
                 let bytes = cursor.take_kept_values(old_text);
-                // SAFETY: `validate_utf8` found that these bytes are UTF-8.
-                let text = Text::new(unsafe { String::from_utf8_unchecked(bytes) });
+                let text = Text::from_bytes(bytes);
                 match reg {
                     Register::Value(value) => *value = Value::Text(text),
                     _ => *reg = Register::Value(Value::Text(text)),
@@ -7952,16 +7945,16 @@ fn update_agg_payload(
                 let Value::Text(rendered) = rendered else {
                     unreachable!("GroupConcat rendering target is Text");
                 };
-                *first_separator_len = i64::try_from(rendered.as_str().len())
+                *first_separator_len = i64::try_from(rendered.as_bytes().len())
                     .map_err(|_| LimboError::IntegerOverflow)?;
             } else {
                 let before_separator = match acc {
-                    Value::Text(text) => text.as_str().len(),
+                    Value::Text(text) => text.as_bytes().len(),
                     _ => unreachable!("GroupConcat accumulator is Text after initialization"),
                 };
                 acc.exec_group_concat(delimiter)?;
                 let after_separator = match acc {
-                    Value::Text(text) => text.as_str().len(),
+                    Value::Text(text) => text.as_bytes().len(),
                     _ => unreachable!("GroupConcat accumulator is Text after its first value"),
                 };
                 let separator_len = after_separator
@@ -9500,7 +9493,7 @@ fn inverse_agg_payload(
             let Value::Text(rendered) = rendered else {
                 unreachable!("GroupConcat rendering target is Text");
             };
-            let value_len = rendered.as_str().len();
+            let value_len = rendered.as_bytes().len();
 
             *count -= 1;
             let separator_len = if !separator_lengths.is_empty() && *count > 0 {
@@ -9522,8 +9515,11 @@ fn inverse_agg_payload(
             let Value::Text(text) = acc else {
                 return Ok(());
             };
-            let accumulated_len = text.as_str().len();
-            if remove_len < accumulated_len && !text.as_str().is_char_boundary(remove_len) {
+            let accumulated_len = text.as_bytes().len();
+            if text.is_utf8()
+                && remove_len < accumulated_len
+                && !text.as_str().is_char_boundary(remove_len)
+            {
                 return Err(LimboError::InternalError(format!(
                     "GroupConcat xInverse removes {remove_len} bytes from {accumulated_len}"
                 )));
@@ -9536,9 +9532,9 @@ fn inverse_agg_payload(
             } else if remove_len >= accumulated_len {
                 // Empty values can still remain; keep the accumulator as Text
                 // so the next step appends a separator before its value.
-                text.value.to_mut().clear();
+                text.remove_prefix(accumulated_len);
             } else {
-                text.value.to_mut().drain(..remove_len);
+                text.remove_prefix(remove_len);
             }
         }
         AggFunc::Min
@@ -16225,7 +16221,7 @@ pub fn op_concat(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _connection: &Arc<Connection>,
+    connection: &Arc<Connection>,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Concat { lhs, rhs, dest }, insn);
@@ -16246,6 +16242,12 @@ pub fn op_concat(
     let value = state.registers[*lhs]
         .get_value()
         .exec_concat(state.registers[*rhs].get_value())?;
+    let value = match value {
+        Value::Blob(bytes) if !connection.dialect().concatenation_of_blobs_is_blob() => {
+            Value::from_text_bytes(bytes.as_slice().to_vec())
+        }
+        value => value,
+    };
     state.registers[*dest].set_value(value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

@@ -120,6 +120,8 @@ Comparison operators, `IN` and `BETWEEN` also accept row values, which compare e
 |----------|-------------|---------|--------|
 | `\|\|` | Concatenation | `'hello' \|\| ' ' \|\| 'world'` | `'hello world'` |
 
+The result is TEXT, also for two BLOBs: `x'fffe' || x'41'` is the TEXT of the bytes FF FE 41.
+
 When either operand is an array, `||` performs array concatenation instead. See [Array Operators](#array-operators).
 
 ### Array Operators

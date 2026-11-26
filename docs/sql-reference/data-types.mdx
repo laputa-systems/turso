@@ -18,6 +18,8 @@ Turso uses the same dynamic type system as SQLite, where values have types but c
 | TEXT | A UTF-8 encoded string |
 | BLOB | Raw binary data, stored exactly as input |
 
+As in SQLite, a TEXT is not checked for UTF-8. It keeps the bytes it was given, also bytes that are not UTF-8, such as the result of `CAST(x'fffe' AS TEXT)` or a TEXT that another program wrote.
+
 ```sql
 SELECT typeof(NULL);       -- 'null'
 SELECT typeof(42);         -- 'integer'

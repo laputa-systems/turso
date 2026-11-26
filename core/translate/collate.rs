@@ -24,7 +24,7 @@ use crate::{
         plan::{Plan, SelectPlan, TableReferences},
     },
     type_ordering::TypeOrdering,
-    types::ValueRef,
+    types::{TextRef, ValueRef},
     vdbe::hash_table::normalized_f64_bits,
     LimboError, Numeric, Result,
 };
@@ -172,7 +172,7 @@ impl CollationSeq {
         match (self, lhs, rhs) {
             (Self::Type(ordering), _, _) => ordering.compare(lhs, rhs),
             (Self::Text(collation), ValueRef::Text(lhs), ValueRef::Text(rhs)) => {
-                collation.compare_strings(lhs.as_str(), rhs.as_str())
+                collation.compare_texts(lhs, rhs)
             }
             (Self::Text(_), _, _) => lhs.cmp(&rhs),
         }
@@ -220,7 +220,7 @@ impl CollationSeq {
             }
             ValueRef::Text(text) => {
                 hasher.write_u8(TEXT_HASH);
-                collation.hash_text(text.as_str(), hasher);
+                collation.hash_text(text, hasher);
             }
             ValueRef::Blob(blob) => {
                 hasher.write_u8(BLOB_HASH);
@@ -283,33 +283,49 @@ impl TextCollation {
         }
     }
 
-    fn hash_text(self, text: &str, hasher: &mut impl Hasher) {
+    fn hash_text(self, text: TextRef, hasher: &mut impl Hasher) {
+        let bytes = text.as_bytes();
         match self {
-            Self::Binary => hasher.write(text.as_bytes()),
+            Self::Binary => hasher.write(bytes),
             Self::NoCase => {
                 // Stops at the first NUL like the comparison does.
-                hasher.write_usize(text.len());
-                for byte in text.bytes() {
+                hasher.write_usize(bytes.len());
+                for &byte in bytes {
                     hasher.write_u8(byte.to_ascii_lowercase());
                     if byte == 0 {
                         break;
                     }
                 }
             }
-            Self::Rtrim => hasher.write(text.trim_end_matches(' ').as_bytes()),
-            Self::Locale(id) => hasher.write(&LocaleCollationRegistry::global().sort_key(id, text)),
+            Self::Rtrim => hasher.write(trim_end_spaces(bytes)),
+            Self::Locale(id) => {
+                hasher.write(&LocaleCollationRegistry::global().sort_key(id, text.as_str()))
+            }
             Self::Custom(_) => {
                 unreachable!("hash tables reject collations that cannot hash (see can_hash)")
             }
         }
     }
 
+    /// Orders two texts. BINARY, NOCASE and RTRIM compare their bytes, which
+    /// need not be UTF-8. A locale or custom collation compares their
+    /// [TextRef::as_str].
+    #[inline(always)]
+    fn compare_texts(self, lhs: TextRef, rhs: TextRef) -> Ordering {
+        match self {
+            Self::Binary => binary_cmp(lhs.as_bytes(), rhs.as_bytes()),
+            Self::NoCase => nocase_cmp(lhs.as_bytes(), rhs.as_bytes()),
+            Self::Rtrim => rtrim_cmp(lhs.as_bytes(), rhs.as_bytes()),
+            Self::Locale(_) | Self::Custom(_) => self.compare_strings(lhs.as_str(), rhs.as_str()),
+        }
+    }
+
     #[inline(always)]
     fn compare_strings(self, lhs: &str, rhs: &str) -> Ordering {
         match self {
-            Self::Binary => binary_cmp(lhs, rhs),
-            Self::NoCase => nocase_cmp(lhs, rhs),
-            Self::Rtrim => rtrim_cmp(lhs, rhs),
+            Self::Binary => binary_cmp(lhs.as_bytes(), rhs.as_bytes()),
+            Self::NoCase => nocase_cmp(lhs.as_bytes(), rhs.as_bytes()),
+            Self::Rtrim => rtrim_cmp(lhs.as_bytes(), rhs.as_bytes()),
             Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
             Self::Custom(number) => custom_collation(number).compare(lhs, rhs),
         }
@@ -328,13 +344,13 @@ fn custom_collation(number: u32) -> Arc<ExternalCollation> {
 }
 
 #[inline(always)]
-fn binary_cmp(lhs: &str, rhs: &str) -> Ordering {
+fn binary_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
     lhs.cmp(rhs)
 }
 
 #[inline(always)]
-fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
-    for (left, right) in lhs.bytes().zip(rhs.bytes()) {
+fn nocase_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
+    for (&left, &right) in lhs.iter().zip(rhs) {
         let left = left.to_ascii_lowercase();
         let right = right.to_ascii_lowercase();
         if left != right {
@@ -348,8 +364,15 @@ fn nocase_cmp(lhs: &str, rhs: &str) -> Ordering {
 }
 
 #[inline(always)]
-fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
-    lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
+fn rtrim_cmp(lhs: &[u8], rhs: &[u8]) -> Ordering {
+    trim_end_spaces(lhs).cmp(trim_end_spaces(rhs))
+}
+
+/// `bytes` without the spaces at their end.
+#[inline(always)]
+fn trim_end_spaces(bytes: &[u8]) -> &[u8] {
+    let end = bytes.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
+    &bytes[..end]
 }
 
 impl std::fmt::Display for TextCollation {

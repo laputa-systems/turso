@@ -403,6 +403,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn concatenation_of_blobs_is_blob(&self) -> bool {
+        true
+    }
+
     fn write_array_blob_element(&self, out: &mut String, blob: &[u8]) {
         out.push_str(&crate::text::encode_bytea(blob, true));
     }

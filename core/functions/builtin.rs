@@ -1266,7 +1266,7 @@ pub(crate) fn exec_boolean_to_int(value: &Value) -> crate::Result<Value> {
             }
         },
         Value::Text(t) => {
-            let v = &t.value;
+            let v = t.as_str();
             match v.to_ascii_lowercase().as_str() {
                 "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
                 "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
@@ -1290,7 +1290,7 @@ pub(crate) fn exec_validate_ipaddr(value: &Value) -> crate::Result<Value> {
     Ok(match value {
         Value::Null => Value::Null,
         Value::Text(t) => {
-            let v = &t.value;
+            let v = t.as_str();
             v.parse::<std::net::IpAddr>().map_err(|_| {
                 LimboError::Constraint(format!("invalid input for type inet: \"{v}\""))
             })?;

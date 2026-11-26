@@ -564,7 +564,7 @@ fn format_string(output: &mut String, value: &Value, spec: &FormatSpec) {
 fn format_char(output: &mut String, value: &Value, spec: &FormatSpec) {
     // In SQLite SQL context, %c takes the first character of the string representation
     let c = match value {
-        Value::Text(t) => t.value.chars().next().unwrap_or('\0'),
+        Value::Text(t) => t.as_str().chars().next().unwrap_or('\0'),
         _ => {
             let s = coerce_to_string(value);
             s.chars().next().unwrap_or('\0')
@@ -855,6 +855,8 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
     let format_str = until_nul(format_str);
 
     let mut result = String::new();
+    let mut spliced = Vec::new();
+    let null_val = Value::Null;
     let mut args_index = 0;
     let mut chars = format_str.chars().peekable();
     if format_str.is_empty() {
@@ -894,7 +896,6 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
 
         // Get the argument value (or use NULL if missing)
         let needs_arg = !matches!(spec.spec_type, 'n' | '\0');
-        let null_val = Value::Null;
         let arg = if needs_arg {
             if args_index < args.len() {
                 let v = args[args_index];
@@ -915,7 +916,10 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
             'X' => format_hex(&mut result, arg, &spec, true),
             'o' => format_octal(&mut result, arg, &spec),
             'p' => format_hex(&mut result, arg, &spec, true),
-            's' | 'z' => format_string(&mut result, arg, &spec),
+            's' | 'z' => match non_utf8_text(arg) {
+                Some(bytes) => format_non_utf8_string(&mut result, &mut spliced, bytes, &spec),
+                None => format_string(&mut result, arg, &spec),
+            },
             'c' => format_char(&mut result, arg, &spec),
             'q' => format_sql_quote(&mut result, arg, &spec),
             'Q' => format_sql_quote_wrap(&mut result, arg, &spec),
@@ -936,7 +940,79 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
         touched = true;
     }
 
-    Ok(Value::build_text(result))
+    if spliced.is_empty() {
+        return Ok(Value::build_text(result));
+    }
+    let mut bytes = Vec::with_capacity(result.len());
+    let mut copied = 0;
+    for (offset, text) in spliced {
+        bytes.extend_from_slice(&result.as_bytes()[copied..offset]);
+        bytes.extend_from_slice(text);
+        copied = offset;
+    }
+    bytes.extend_from_slice(&result.as_bytes()[copied..]);
+    Ok(Value::from_text_bytes(bytes))
+}
+
+/// The text of `value` as `sqlite3_value_text` reads it, up to its first NUL,
+/// when those bytes are not UTF-8.
+fn non_utf8_text(value: &Value) -> Option<&[u8]> {
+    let bytes = match value {
+        Value::Text(text) if !text.is_utf8() => text.as_bytes(),
+        Value::Blob(blob) => blob.as_slice(),
+        _ => return None,
+    };
+    let bytes = &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())];
+    match str::from_utf8(bytes) {
+        Ok(_) => None,
+        Err(_) => Some(bytes),
+    }
+}
+
+/// `%s` of text bytes that are not UTF-8, as SQLite formats them: the
+/// precision counts bytes, or characters with the `!` flag, and the width
+/// counts bytes, or bytes that are not continuation bytes with the `!` flag.
+/// `output` cannot hold the bytes, so they go into `spliced` with the offset
+/// in `output` where they belong.
+fn format_non_utf8_string<'a>(
+    output: &mut String,
+    spliced: &mut Vec<(usize, &'a [u8])>,
+    text: &'a [u8],
+    spec: &FormatSpec,
+) {
+    let length = match spec.precision {
+        Some(precision) if spec.flags.alt_form_2 => {
+            let mut end = 0;
+            for _ in 0..precision {
+                let Some(&lead) = text.get(end) else {
+                    break;
+                };
+                end += 1;
+                if lead >= 0xc0 {
+                    while text.get(end).is_some_and(|&b| b & 0xc0 == 0x80) {
+                        end += 1;
+                    }
+                }
+            }
+            end
+        }
+        Some(precision) => precision.min(text.len()),
+        None => text.len(),
+    };
+    let text = &text[..length];
+    let shown = if spec.flags.alt_form_2 {
+        text.iter().filter(|&&b| b & 0xc0 != 0x80).count()
+    } else {
+        length
+    };
+    let pad = spec.width.unwrap_or(0).saturating_sub(shown);
+    if !spec.flags.left_justify {
+        output.extend(repeat_n(' ', pad));
+    }
+    spliced.push((output.len(), text));
+    if spec.flags.left_justify {
+        output.extend(repeat_n(' ', pad));
+    }
 }
 
 /// Append `value` as `printf('%.<precision>g', value)` writes it.
