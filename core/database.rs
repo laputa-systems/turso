@@ -40,6 +40,7 @@ use crate::{
         page_cache::PageCache,
         page_transform::PageTransform,
         pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut, SharedPagerState},
+        rollback_journal::{self, RollbackJournal, RollbackJournalShared},
         sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion, TextEncoding, Version},
     },
     sync::{
@@ -89,6 +90,7 @@ pub struct DatabaseOpts {
     /// write the conversion and keep the current mode.
     pub enable_mvcc: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
+    pub enable_rollback_journal: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
 }
@@ -151,6 +153,11 @@ impl DatabaseOpts {
 
     pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
         self.enable_multiprocess_wal = enable;
+        self
+    }
+
+    pub fn with_rollback_journal(mut self, enable: bool) -> Self {
+        self.enable_rollback_journal = enable;
         self
     }
 
@@ -809,6 +816,7 @@ pub struct Database<
     pub(crate) shared_wal: Arc<RwLock<WalFileShared>>,
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
+    pub(crate) rollback_journal: ArcSwapOption<RollbackJournalShared>,
     pub(crate) open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
@@ -973,6 +981,7 @@ impl Database {
             shared_wal,
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
+            rollback_journal: ArcSwapOption::empty(),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
             dialect,
@@ -1133,6 +1142,17 @@ impl Database {
         if options.encryption.is_some() && !options.db_opts.enable_encryption {
             return Err(LimboError::InvalidArgument(
                 "encryption is an opt in feature".into(),
+            ));
+        }
+        if options.db_opts.enable_rollback_journal
+            && (options.db_opts.enable_mvcc
+                || options.db_opts.enable_multiprocess_wal
+                || options.encryption.is_some()
+                || options.page_codec.is_some())
+        {
+            return Err(LimboError::InvalidArgument(
+                "the rollback journal cannot be combined with MVCC, multiprocess WAL, encryption or a page codec"
+                    .into(),
             ));
         }
         Ok(())
@@ -1745,6 +1765,14 @@ impl Database {
                     } else {
                         &format!("{path}-wal")
                     };
+                    if opts.enable_rollback_journal && !is_memory_like(path) {
+                        rollback_journal::recover_hot_journal(
+                            io.as_ref(),
+                            db_file.as_ref(),
+                            &rollback_journal::journal_path(path),
+                            flags,
+                        )?;
+                    }
                     let mut db = Self::new(
                         opts,
                         flags,
@@ -1796,9 +1824,13 @@ impl Database {
                         let wal_enabled =
                             db.shared_wal.read().metadata.enabled.load(Ordering::SeqCst);
                         let mv_store_enabled = db.get_mv_store().is_some();
+                        let rollback_journal_enabled = db.rollback_journal.load().is_some();
                         assert!(
-                            db.is_readonly() || wal_enabled || mv_store_enabled,
-                            "Either WAL or MVStore must be enabled"
+                            db.is_readonly()
+                                || wal_enabled
+                                || mv_store_enabled
+                                || rollback_journal_enabled,
+                            "Either WAL, MVStore or the rollback journal must be enabled"
                         );
                     }
                     // Wrap db in Arc before connecting
@@ -2338,6 +2370,34 @@ impl Database {
                         )).into());
                     }
 
+                    let use_rollback_journal = self.opts.enable_rollback_journal
+                        && !self.is_in_memory_db()
+                        && match read_version {
+                            Version::Legacy => !self.wal_file_has_content()?,
+                            Version::Wal => !self.initialized(),
+                            Version::Mvcc => false,
+                        };
+                    if use_rollback_journal {
+                        if log_exists {
+                            return Err(LimboError::Corrupt(format!(
+                                "MVCC logical log file exists for database {}, but database header indicates rollback-journal mode. The database may be corrupted.",
+                                self.path
+                            )).into());
+                        }
+                        drop(header);
+                        let HeaderValidationState::Validate { mut pager, .. } = std::mem::take(st)
+                        else {
+                            unreachable!("state is Validate");
+                        };
+                        if !self.initialized() {
+                            pager.set_initial_rollback_journal_header()?;
+                        }
+                        let shared = Arc::new(RollbackJournalShared::new(&self.path));
+                        self.rollback_journal.store(Some(shared.clone()));
+                        pager.set_rollback_journal(RollbackJournal::new(shared));
+                        return Ok(IOResult::Done(Arc::new(*pager)));
+                    }
+
                     // Now check the Header Version to see which mode the DB file really is on
                     // Track if header was modified so we can write it to disk
                     let header_modified = match read_version {
@@ -2574,6 +2634,116 @@ impl Database {
                 Err(_) => self.path.to_string(),
             }
         }
+    }
+
+    fn wal_file_has_content(&self) -> Result<bool> {
+        match self.io.open_file(&self.wal_path, OpenFlags::ReadOnly, false) {
+            Ok(file) => Ok(file.size()? > 0),
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                _,
+            ))) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) fn switch_rollback_journal_to_wal(
+        self: &Arc<Self>,
+        connection: &Arc<Connection>,
+    ) -> Result<()> {
+        self.check_sole_idle_connection(connection)?;
+        let pager = connection.pager.load_full();
+        let journal = pager
+            .rollback_journal()
+            .expect("the connection uses the rollback journal")
+            .shared()
+            .clone();
+        if pager.db_initialized() {
+            write_header_version_through_journal(&pager, connection.get_sync_mode(), Version::Wal)?;
+        } else {
+            pager.set_initial_wal_header()?;
+        }
+        let shared_wal =
+            WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, self.open_flags)?;
+        let state = std::mem::replace(&mut *shared_wal.write(), WalFileShared::new_noop_state());
+        *self.shared_wal.write() = state;
+        journal.retire();
+        self.rollback_journal.store(None);
+        self.replace_connection_pager(connection, &pager)?;
+        Ok(())
+    }
+
+    pub(crate) fn switch_wal_to_rollback_journal(
+        self: &Arc<Self>,
+        connection: &Arc<Connection>,
+        mode: rollback_journal::RollbackJournalMode,
+    ) -> Result<()> {
+        self.check_sole_idle_connection(connection)?;
+        let pager = connection.pager.load_full();
+        let initialized = pager.db_initialized();
+        if initialized {
+            let checkpoint = pager.blocking_checkpoint(
+                storage::wal::CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
+                connection.get_sync_mode(),
+            )?;
+            if checkpoint.wal_total_backfilled < checkpoint.wal_max_frame {
+                return Err(LimboError::Busy);
+            }
+        }
+        *self.shared_wal.write() = WalFileShared::new_noop_state();
+        match self.io.remove_file(&self.wal_path) {
+            Ok(()) => {}
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+                _,
+            ))) => {}
+            Err(err) => return Err(err),
+        }
+        let journal = Arc::new(RollbackJournalShared::new(&self.path));
+        journal.set_mode(mode);
+        self.rollback_journal.store(Some(journal));
+        let pager = self.replace_connection_pager(connection, &pager)?;
+        if initialized {
+            write_header_version_through_journal(
+                &pager,
+                connection.get_sync_mode(),
+                Version::Legacy,
+            )?;
+        } else {
+            pager.set_initial_rollback_journal_header()?;
+        }
+        Ok(())
+    }
+
+    fn check_sole_idle_connection(&self, connection: &Connection) -> Result<()> {
+        if self.n_connections.load(Ordering::SeqCst) > 1 {
+            return Err(LimboError::TxError(
+                "cannot change between wal and rollback journal modes while other connections are open"
+                    .into(),
+            ));
+        }
+        if connection.n_active_root_statements.load(Ordering::SeqCst) > 1 {
+            return Err(LimboError::StatementsInProgress(
+                "cannot change between wal and rollback journal modes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn replace_connection_pager(
+        self: &Arc<Self>,
+        connection: &Arc<Connection>,
+        old: &Pager,
+    ) -> Result<Arc<Pager>> {
+        let pager = Arc::new(self._init(None, None)?);
+        pager.change_page_cache_size(old.page_cache_capacity())?;
+        pager.set_spill_enabled(old.get_spill_enabled());
+        pager.set_sync_type(old.get_sync_type());
+        connection.pager.store(pager.clone());
+        connection.bump_prepare_context_generation();
+        Ok(pager)
     }
 
     pub(crate) fn encryption_cipher(&self) -> CipherMode {
@@ -3673,6 +3843,9 @@ impl Database {
             self.buffer_pool.clone(),
             self.pager_state.clone(),
         )?;
+        if let Some(shared) = self.rollback_journal.load_full() {
+            pager.set_rollback_journal(RollbackJournal::new(shared));
+        }
         pager.set_authenticated_header(header)?;
         pager.enable_encryption(self.opts.enable_encryption);
         if self.initialized() {
@@ -4121,6 +4294,36 @@ impl Database {
         }
         taken
     }
+}
+
+fn write_header_version_through_journal(
+    pager: &Pager,
+    sync_mode: SyncMode,
+    version: Version,
+) -> Result<()> {
+    let journal = pager
+        .rollback_journal()
+        .expect("the pager uses the rollback journal");
+    pager.begin_read_tx()?;
+    let raw_version = RawVersion::from(version);
+    let result = pager
+        .io
+        .block(|| pager.begin_write_tx(WalAutoActions::empty()))
+        .and_then(|()| {
+            pager.io.block(|| {
+                pager.with_header_mut(|header| {
+                    header.read_version = raw_version;
+                    header.write_version = raw_version;
+                })
+            })
+        })
+        .and_then(|()| pager.io.block(|| journal.commit(pager, sync_mode)));
+    if result.is_err() {
+        pager.rollback_attached();
+    } else {
+        pager.end_read_tx();
+    }
+    result
 }
 
 /// `PRAGMA journal_mode = 'mvcc'`, which converts a database to MVCC. It is

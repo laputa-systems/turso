@@ -42,6 +42,7 @@ mod query_processing;
 mod query_timeout;
 mod queued_io;
 mod reindex;
+mod rollback_journal;
 mod schema;
 mod security;
 mod statement;

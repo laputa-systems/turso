@@ -35,6 +35,7 @@ use crate::storage::btree::{
 use crate::storage::database::DatabaseFile;
 use crate::storage::encryption::CipherMode;
 use crate::storage::journal_mode;
+use crate::storage::rollback_journal::RollbackJournalMode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{
     default_page1, CreateBTreeFlags, PageRef, SavepointResult, SharedPagerState,
@@ -19389,6 +19390,13 @@ fn op_journal_mode_inner(
     loop {
         match state.active_op_state.journal_mode().sub_state {
             OpJournalModeSubState::Start => {
+                if let Some(mode) =
+                    rollback_journal_mode_pragma(connection, pager, *db, new_mode.as_deref())?
+                {
+                    state.registers[*dest].set_text(Text::new(mode))?;
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
                 // Read header to get current mode
                 let mv_store = connection.mv_store_for_db(*db);
                 let header_result =
@@ -19693,6 +19701,64 @@ fn op_journal_mode_inner(
             }
         }
     }
+}
+
+fn rollback_journal_mode_pragma(
+    connection: &Arc<Connection>,
+    pager: &Arc<Pager>,
+    db: usize,
+    new_mode: Option<&str>,
+) -> Result<Option<&'static str>> {
+    let requested = new_mode.and_then(|mode| journal_mode::JournalMode::from_str(mode).ok());
+    let requested_rollback_mode = requested.and_then(RollbackJournalMode::from_journal_mode);
+    if let Some(journal) = pager.rollback_journal() {
+        let current = journal.shared().mode();
+        let current_name: &'static str = current.as_journal_mode().into();
+        if let Some(mode) = requested_rollback_mode {
+            if pager.holds_write_lock() {
+                return Ok(Some(current_name));
+            }
+            journal.shared().set_mode(mode);
+            return Ok(Some(mode.as_journal_mode().into()));
+        }
+        if requested == Some(journal_mode::JournalMode::Wal) && db == crate::MAIN_DB_ID {
+            check_journal_mode_switch(connection, db, "into")?;
+            connection.db.switch_rollback_journal_to_wal(connection)?;
+            return Ok(Some(journal_mode::JournalMode::Wal.into()));
+        }
+        return Ok(Some(current_name));
+    }
+    let Some(mode) = requested_rollback_mode else {
+        return Ok(None);
+    };
+    if !connection.db.opts.enable_rollback_journal
+        || db != crate::MAIN_DB_ID
+        || pager.wal.is_none()
+        || connection.mv_store_for_db(db).is_some()
+    {
+        return Ok(None);
+    }
+    check_journal_mode_switch(connection, db, "out of")?;
+    connection
+        .db
+        .switch_wal_to_rollback_journal(connection, mode)?;
+    Ok(Some(mode.as_journal_mode().into()))
+}
+
+fn check_journal_mode_switch(
+    connection: &Arc<Connection>,
+    db: usize,
+    direction: &str,
+) -> Result<()> {
+    if !connection.get_auto_commit() {
+        return Err(LimboError::TxError(format!(
+            "cannot change {direction} wal mode from within a transaction"
+        )));
+    }
+    if connection.is_readonly(db) {
+        return Err(LimboError::ReadOnly);
+    }
+    Ok(())
 }
 
 pub fn op_filter(

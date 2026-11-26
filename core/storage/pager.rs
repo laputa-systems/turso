@@ -5,6 +5,7 @@ use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
+use crate::storage::rollback_journal::{RollbackJournal, HEADER_SQLITE_VERSION_NUMBER};
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
 use crate::storage::{
@@ -1699,6 +1700,7 @@ pub struct Pager {
     /// The write-ahead log (WAL) for the database.
     /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
     pub(crate) wal: Option<Arc<dyn Wal>>,
+    rollback_journal: Option<RollbackJournal>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
     /// Buffer pool for temporary data storage.
@@ -2026,6 +2028,7 @@ impl Pager {
         Ok(Self {
             db_file,
             wal,
+            rollback_journal: None,
             page_cache: Arc::new(RwLock::new(page_cache)),
             io,
             pending_reads: RwLock::new(HashMap::new()),
@@ -2784,6 +2787,15 @@ impl Pager {
         Ok(IOResult::Done(clamped_max))
     }
 
+    pub(crate) fn set_rollback_journal(&mut self, journal: RollbackJournal) {
+        turso_assert!(self.wal.is_none(), "a pager uses either a WAL or a rollback journal");
+        self.rollback_journal = Some(journal);
+    }
+
+    pub(crate) fn rollback_journal(&self) -> Option<&RollbackJournal> {
+        self.rollback_journal.as_ref()
+    }
+
     pub fn set_wal(&mut self, wal: Arc<dyn Wal>) {
         wal.set_io_context(self.io_ctx.read().clone());
         self.wal = Some(wal);
@@ -3281,6 +3293,40 @@ impl Pager {
         }
     }
 
+    pub(crate) fn set_initial_rollback_journal_header(&self) -> Result<()> {
+        turso_assert!(!self.db_initialized());
+        let legacy = sqlite3_ondisk::RawVersion::from(sqlite3_ondisk::Version::Legacy);
+        let IOResult::Done(_) = self.with_header_mut(|header| {
+            header.read_version = legacy;
+            header.write_version = legacy;
+            header.change_counter = 0.into();
+            header.version_valid_for = 0.into();
+            header.version_number = HEADER_SQLITE_VERSION_NUMBER.into();
+        })?
+        else {
+            panic!("DB should not be initialized and should not do any IO");
+        };
+        self.dirty_pages.write().clear();
+        Ok(())
+    }
+
+    pub(crate) fn set_initial_wal_header(&self) -> Result<()> {
+        turso_assert!(!self.db_initialized());
+        let defaults = DatabaseHeader::default();
+        let IOResult::Done(_) = self.with_header_mut(|header| {
+            header.read_version = defaults.read_version;
+            header.write_version = defaults.write_version;
+            header.change_counter = defaults.change_counter;
+            header.version_valid_for = defaults.version_valid_for;
+            header.version_number = defaults.version_number;
+        })?
+        else {
+            panic!("DB should not be initialized and should not do any IO");
+        };
+        self.dirty_pages.write().clear();
+        Ok(())
+    }
+
     /// Set the initial journal version in page 1 before the database is initialized.
     pub fn set_initial_journal_version(&self, version: sqlite3_ondisk::Version) -> Result<()> {
         turso_assert!(!self.db_initialized());
@@ -3427,10 +3473,13 @@ impl Pager {
     #[inline(always)]
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn begin_read_tx(&self) -> Result<()> {
-        let Some(wal) = self.wal.as_ref() else {
+        let changed = if let Some(journal) = self.rollback_journal.as_ref() {
+            journal.begin_read_tx(self.io.as_ref(), self.db_file.as_ref())?
+        } else if let Some(wal) = self.wal.as_ref() {
+            wal.begin_read_tx()?
+        } else {
             return Ok(());
         };
-        let changed = wal.begin_read_tx()?;
         if changed {
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache(false);
@@ -3479,6 +3528,10 @@ impl Pager {
     pub fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> IOResultOr<()> {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
+        if let Some(journal) = self.rollback_journal.as_ref() {
+            journal.begin_write_tx()?;
+            return self.maybe_allocate_page1();
+        }
         return_if_io!(self.maybe_allocate_page1());
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
@@ -3548,6 +3601,26 @@ impl Pager {
     ) -> IOResultOr<()> {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
+            return Ok(IOResult::Done(()));
+        }
+        if let Some(journal) = self.rollback_journal.as_ref() {
+            return_if_io!(journal.commit(self, sync_mode));
+            let schema_did_change = matches!(
+                connection.get_tx_state(),
+                TransactionState::Write {
+                    schema_did_change: true
+                }
+            );
+            journal.end_write_tx();
+            journal.end_read_tx();
+            if schema_did_change {
+                let schema = connection.schema.read().clone();
+                connection.db.update_schema_if_newer(schema);
+            }
+            if update_transaction_state {
+                connection.set_tx_state(TransactionState::None);
+            }
+            self.clear_savepoints()?;
             return Ok(IOResult::Done(()));
         }
         let Some(wal) = self.wal.as_ref() else {
@@ -3638,6 +3711,22 @@ impl Pager {
             // Parent statement will handle the transaction rollback.
             return;
         }
+        if let Some(journal) = self.rollback_journal.as_ref() {
+            let (is_write, schema_did_change) = match connection.get_tx_state() {
+                TransactionState::Write { schema_did_change } => (true, schema_did_change),
+                _ => (false, false),
+            };
+            if is_write {
+                self.clear_savepoints()
+                    .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
+                if let Err(err) = journal.abort_commit(self.io.as_ref(), self.db_file.as_ref()) {
+                    tracing::error!("rolling back the journal of a failed commit failed: {err}");
+                }
+            }
+            self.rollback(schema_did_change, connection, is_write);
+            journal.end_read_tx();
+            return;
+        }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return;
@@ -3662,6 +3751,13 @@ impl Pager {
     }
 
     pub(crate) fn cleanup_read_tx(&self) {
+        if let Some(journal) = self.rollback_journal.as_ref() {
+            self.reset_internal_states();
+            if journal.holds_read_lock() {
+                journal.end_read_tx();
+            }
+            return;
+        }
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
@@ -3673,6 +3769,10 @@ impl Pager {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn end_read_tx(&self) {
+        if let Some(journal) = self.rollback_journal.as_ref() {
+            journal.end_read_tx();
+            return;
+        }
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
@@ -3681,6 +3781,10 @@ impl Pager {
 
     /// End just the write transaction on the WAL, without affecting the read lock.
     pub fn end_write_tx(&self) {
+        if let Some(journal) = self.rollback_journal.as_ref() {
+            journal.end_write_tx();
+            return;
+        }
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
@@ -3689,6 +3793,9 @@ impl Pager {
 
     /// Returns true if this pager's WAL currently holds a read lock.
     pub fn holds_read_lock(&self) -> bool {
+        if let Some(journal) = self.rollback_journal.as_ref() {
+            return journal.holds_read_lock();
+        }
         let Some(wal) = self.wal.as_ref() else {
             return false;
         };
@@ -3696,6 +3803,9 @@ impl Pager {
     }
 
     pub fn holds_write_lock(&self) -> bool {
+        if let Some(journal) = self.rollback_journal.as_ref() {
+            return journal.holds_write_lock();
+        }
         let Some(wal) = self.wal.as_ref() else {
             return false;
         };
@@ -3705,6 +3815,22 @@ impl Pager {
     /// Rollback and clean up an attached database pager's transaction.
     /// Unlike rollback_tx, this doesn't modify connection-level state.
     pub fn rollback_attached(&self) {
+        if let Some(journal) = self.rollback_journal.as_ref() {
+            if journal.holds_write_lock() {
+                self.clear_savepoints()
+                    .expect("clear_savepoints should not fail for attached DB");
+                if let Err(err) = journal.abort_commit(self.io.as_ref(), self.db_file.as_ref()) {
+                    tracing::error!("rolling back the journal of a failed commit failed: {err}");
+                }
+                self.discard_uncommitted_pages();
+                self.reset_internal_states();
+                self.set_schema_cookie(None);
+            } else {
+                self.reset_internal_states();
+            }
+            journal.end_read_tx();
+            return;
+        }
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
@@ -3995,6 +4121,10 @@ impl Pager {
         Ok(page)
     }
 
+    pub(crate) fn page_cache_capacity(&self) -> usize {
+        self.page_cache.read().capacity()
+    }
+
     /// Changes the size of the page cache.
     pub fn change_page_cache_size(&self, capacity: usize) -> Result<CacheResizeResult> {
         let mut page_cache = self.page_cache.write();
@@ -4060,6 +4190,14 @@ impl Pager {
         }
         page.set_dirty();
         Ok(())
+    }
+
+    pub(crate) fn dirty_page_ids(&self) -> Vec<u32> {
+        self.dirty_pages.read().iter().collect()
+    }
+
+    pub(crate) fn clear_dirty_page_set(&self) {
+        self.dirty_pages.write().clear();
     }
 
     pub(crate) fn pages_dirtied_count(&self) -> u64 {
@@ -4362,6 +4500,9 @@ impl Pager {
     /// For ephemeral tables: writes pages directly to the temp database file.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn try_spill_dirty_pages(&self) -> IOResultOr<()> {
+        if self.rollback_journal.is_some() {
+            return Ok(IOResult::Done(()));
+        }
         loop {
             let state = self.spill_state.read().clone();
             match state {

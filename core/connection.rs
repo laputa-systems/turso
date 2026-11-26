@@ -2281,10 +2281,11 @@ impl Connection {
         let is_memory_db = is_memory_like(&self.db.path);
         // For MVCC the shutdown checkpoint only fsyncs the WAL, which is needed only while
         // the WAL holds frames that are not yet copied into the database file.
-        let should_checkpoint_on_close = pager.wal.as_ref().is_none_or(|wal| {
-            wal.should_checkpoint_on_close()
-                && (!self.mvcc_enabled() || wal.get_max_frame_in_wal() > wal.backfill_frame())
-        });
+        let should_checkpoint_on_close = pager.rollback_journal().is_none()
+            && pager.wal.as_ref().is_none_or(|wal| {
+                wal.should_checkpoint_on_close()
+                    && (!self.mvcc_enabled() || wal.get_max_frame_in_wal() > wal.backfill_frame())
+            });
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
             && !self.db.is_readonly()
             && !is_memory_db

@@ -35,6 +35,12 @@ impl IOContext {
         }
     }
 
+    pub(crate) fn untransformed() -> Self {
+        Self {
+            page_transform: PageTransform::None,
+        }
+    }
+
     pub fn set_encryption(&mut self, encryption_ctx: EncryptionContext) {
         self.page_transform = PageTransform::Codec(page_codec_from_encryption(encryption_ctx));
     }

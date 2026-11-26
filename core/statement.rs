@@ -1166,6 +1166,7 @@ impl Statement {
             crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
             let schema = conn.schema.read().clone();
+            self.pager = conn.get_pager();
             translate::translate(
                 &schema,
                 stmt,
