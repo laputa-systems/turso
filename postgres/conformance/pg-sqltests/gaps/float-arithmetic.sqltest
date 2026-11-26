@@ -1,0 +1,143 @@
+# Known tursopg gaps against PostgreSQL: arithmetic and aggregates on float4 and
+# float8
+#
+# See errors.sqltest for how a gap test reads. Each test is one case of a group
+# of differences. The first group is the result of an operator: it has the type
+# of its operands, so it is written as that type, and a NaN or a zero with a
+# sign is kept through arithmetic.
+
+@database :memory:
+
+# The result of arithmetic on two float4 is a float4, so it has the digits of one.
+@compat-gap "type:float4"
+test float4-addition-gives-float4-digits {
+    CREATE TABLE t (a float4, b float4);
+    INSERT INTO t VALUES (0.1, 0);
+    SELECT a + b FROM t;
+}
+expect {
+    0.1
+}
+expect @tursopg {
+    0.10000000149011612
+}
+
+# The text of a float8 has no ".0" for a whole number.
+@compat-gap "type:float8"
+test float8-arithmetic-is-written-as-a-float8 {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES (1.5);
+    SELECT x + x FROM t;
+}
+expect {
+    3
+}
+expect @tursopg {
+    3.0
+}
+
+@compat-gap "type:float8"
+test float8-product-keeps-negative-zero {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('-0');
+    SELECT x * 1 FROM t;
+}
+expect {
+    -0
+}
+expect @tursopg {
+    0
+}
+
+@compat-gap "type:float8"
+test float8-nan-plus-number-is-nan {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('NaN');
+    SELECT x + 1 FROM t;
+}
+expect {
+    NaN
+}
+expect @tursopg {
+    1
+}
+
+@compat-gap "type:float8"
+test float8-infinity-times-zero-is-nan {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('Infinity');
+    SELECT x * 0 FROM t;
+}
+expect {
+    NaN
+}
+expect @tursopg {
+    
+}
+
+@compat-gap "type:float8"
+test float8-times-an-infinity-literal {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES (2);
+    SELECT x * 'Infinity' FROM t;
+}
+expect {
+    Infinity
+}
+expect @tursopg {
+    0
+}
+
+@compat-gap "type:float8"
+test float8-division-by-nan-is-nan {
+    CREATE TABLE t (x float8, y float8);
+    INSERT INTO t VALUES (0, 'NaN');
+    SELECT x / y FROM t;
+}
+expect {
+    NaN
+}
+@sqlstate 22P02
+expect @tursopg error {
+    invalid input syntax for type numeric: "NaN"
+}
+
+@compat-gap "type:float8"
+test float8-overflow-is-an-error {
+    CREATE TABLE t (x float8, y float8);
+    INSERT INTO t VALUES ('1e308', 10);
+    SELECT x * y FROM t;
+}
+@sqlstate 22003
+expect error {
+    value out of range: overflow
+}
+expect @tursopg {
+    inf
+}
+
+@compat-gap "type:float8"
+test float8-sum-with-nan-is-nan {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('NaN'), (1.5);
+    SELECT sum(x) FROM t;
+}
+expect {
+    NaN
+}
+expect @tursopg {
+    1.5
+}
+
+@compat-gap "type:float8"
+test float8-sum-of-opposite-infinities-is-nan {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('Infinity'), ('-Infinity');
+    SELECT sum(x) FROM t;
+}
+expect {
+    NaN
+}
+expect @tursopg {
+    
+}
