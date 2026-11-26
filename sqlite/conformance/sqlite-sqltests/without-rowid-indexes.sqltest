@@ -299,3 +299,25 @@ expect {
     1|b
     1.0|c
 }
+
+@cross-check-integrity
+test without-rowid-primary-key-collation {
+    CREATE TABLE t(a TEXT, b, c, PRIMARY KEY(a COLLATE NOCASE)) WITHOUT ROWID;
+    CREATE INDEX tc ON t(c);
+    INSERT INTO t VALUES ('x', 1, 'p');
+    INSERT OR IGNORE INTO t VALUES ('X', 2, 'q'), ('y', 3, 'r');
+    REPLACE INTO t VALUES ('Y', 4, 's');
+    SELECT * FROM t;
+    SELECT * FROM t INDEXED BY tc;
+    PRAGMA index_xinfo(tc);
+    PRAGMA integrity_check;
+}
+expect {
+    x|1|p
+    Y|4|s
+    x|1|p
+    Y|4|s
+    0|2|c|0|BINARY|1
+    1|0|a|0|NOCASE|0
+    ok
+}
