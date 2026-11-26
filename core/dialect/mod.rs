@@ -129,6 +129,29 @@ impl dyn Dialect {
     }
 }
 
+/// Where `ALTER TABLE` quotes the new name that it writes in place of each
+/// token of stored schema text that names the renamed table or column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenameQuoting {
+    /// In every place: SQLite does this for a new table name, and for a new
+    /// column name that the statement quotes.
+    Always,
+    /// Where the replaced token is quoted: SQLite does this for a new column
+    /// name that the statement does not quote.
+    WhereQuoted,
+}
+
+impl RenameQuoting {
+    /// The quoting of a new column name as the statement writes it.
+    pub fn of_column(new_name: &ast::Name) -> Self {
+        if new_name.quoted() {
+            Self::Always
+        } else {
+            Self::WhereQuoted
+        }
+    }
+}
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -264,6 +287,13 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(canonical)
     }
 
+    /// Produce the SQL text to store in `sqlite_schema` for a `CREATE VIEW`,
+    /// given the statement as written and the canonical text rendered from
+    /// its AST. The default stores the canonical text.
+    fn format_view_sql(&self, _input: &str, canonical: String) -> Result<String> {
+        Ok(canonical)
+    }
+
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
     /// Schema rewrites cannot reuse the original frontend text because it no
@@ -277,6 +307,23 @@ pub trait Dialect: Send + Sync + 'static {
             ));
         };
         self.format_table_sql(&stmt.to_string(), tbl_name, body)
+    }
+
+    /// Produce the SQL text to store in `sqlite_schema` after `ALTER TABLE`
+    /// renames a table or a column that the stored text `sql` names.
+    ///
+    /// `rewritten` is the statement parsed from `sql`, with each renamed name
+    /// made by [`ast::Name::renamed`] from the name it replaces, and
+    /// `rendered` is the text rendered from `rewritten`. `quoting` says
+    /// where the new name is quoted. The default stores `rendered`.
+    fn renamed_schema_sql(
+        &self,
+        _sql: &str,
+        _rewritten: &Stmt,
+        rendered: String,
+        _quoting: RenameQuoting,
+    ) -> Result<String> {
+        Ok(rendered)
     }
 
     /// Starts the schema a database of this dialect has before its objects

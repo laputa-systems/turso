@@ -301,6 +301,8 @@ pub struct CreateView<'a> {
     pub written_name: &'a ast::Name,
     pub columns: &'a [ast::IndexedColumn],
     pub select: &'a ast::Select,
+    /// The statement as written.
+    pub statement: &'a str,
 }
 
 /// A new materialized view. The statement writes the engine tables that

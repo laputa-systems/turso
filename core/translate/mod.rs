@@ -433,6 +433,7 @@ fn translate_statement(
             if_not_exists,
             connection,
             program,
+            input,
         )?,
         ast::Stmt::CreateMaterializedView {
             view_name,

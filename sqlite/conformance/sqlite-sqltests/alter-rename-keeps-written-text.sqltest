@@ -1,0 +1,36 @@
+@database :memory:
+
+# ALTER TABLE ... RENAME stored the text of each changed schema object as
+# rendered from its parse tree. SQLite edits the stored text in place: it
+# replaces only the tokens that name the renamed table or column, writes a
+# new table name in double quotes, and writes a new column name in double
+# quotes where the replaced token or the new name is quoted.
+
+@skip-if mvcc "views not supported in MVCC mode"
+test rename-keeps-written-text {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, "b" TEXT CHECK (b <> ''), [c] REFERENCES t(a), CHECK (t.c > 0));
+    CREATE INDEX ti ON t (b) WHERE t.c IS NOT NULL;
+    create view v as select  b, t.c from t -- note
+    ;
+    CREATE TRIGGER tr AFTER UPDATE OF b ON t BEGIN UPDATE t SET c = new.b WHERE a = old.a; END;
+    ALTER TABLE t RENAME COLUMN b TO "B 2";
+    ALTER TABLE t RENAME c TO d;
+    ALTER TABLE t RENAME TO u;
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE "u"(a INTEGER PRIMARY KEY, "B 2" TEXT CHECK ("B 2" <> ''), "d" REFERENCES "u"(a), CHECK ("u".d > 0))
+    CREATE INDEX ti ON "u" ("B 2") WHERE "u".d IS NOT NULL
+    CREATE VIEW v as select  "B 2", "u".d from "u" -- note
+    CREATE TRIGGER tr AFTER UPDATE OF "B 2" ON "u" BEGIN UPDATE "u" SET d = new."B 2" WHERE a = old.a; END
+}
+
+test rename-table-keeps-written-name {
+    CREATE TABLE au(id INTEGER PRIMARY KEY, x UNIQUE);
+    ALTER TABLE au RENAME TO "Au 2";
+    SELECT type, name, tbl_name FROM sqlite_schema;
+}
+expect {
+    table|Au 2|Au 2
+    index|sqlite_autoindex_Au 2_1|Au 2
+}

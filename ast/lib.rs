@@ -1356,11 +1356,42 @@ pub struct GroupBy {
 /// identifier or string or `CROSS` or `FULL` or `INNER` or `LEFT` or `NATURAL` or `OUTER` or `RIGHT`.
 ///
 /// Two Names are equal if they refer to the same identifier, regardless of
-/// quoting style (e.g. `ABORT` and `"ABORT"` are the same identifier).
-#[derive(Clone, Debug, Eq)]
+/// quoting style (e.g. `ABORT` and `"ABORT"` are the same identifier) and of
+/// the token they come from.
+#[derive(Clone, Eq)]
 pub struct Name {
     quote: Option<char>,
     value: String,
+    token: NameToken,
+}
+
+/// The byte range of a token in the text that the parser read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// How a [`Name`] relates to the text that the parser read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NameToken {
+    /// The name does not come from parsed text.
+    #[default]
+    None,
+    /// The parser read the name from this token.
+    Read(TokenSpan),
+    /// The name replaces the name that the parser read from this token, as
+    /// when `ALTER TABLE` renames a table or a column.
+    Replaces(TokenSpan),
+}
+
+impl std::fmt::Debug for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Name")
+            .field("quote", &self.quote)
+            .field("value", &self.value)
+            .finish()
+    }
 }
 
 impl PartialEq for Name {
@@ -1417,6 +1448,7 @@ impl Name {
         Self {
             value: s,
             quote: None,
+            token: NameToken::None,
         }
     }
     /// Parse name from the bytes (e.g. handle quoting and handle escaped quotes)
@@ -1427,6 +1459,7 @@ impl Name {
         Self {
             value: String::new(),
             quote: None,
+            token: NameToken::None,
         }
     }
     /// Create a name parsed from a bracket-quoted identifier (`[name]`),
@@ -1435,6 +1468,7 @@ impl Name {
         Self {
             value: s,
             quote: Some('['),
+            token: NameToken::None,
         }
     }
     /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
@@ -1458,6 +1492,7 @@ impl Name {
             Name {
                 value: s,
                 quote: Some(bytes[0] as char),
+                token: NameToken::None,
             }
         } else if bytes[0] == b'[' {
             assert!(s.len() >= 2);
@@ -1522,6 +1557,34 @@ impl Name {
 
     pub const fn quoted(&self) -> bool {
         self.quote.is_some()
+    }
+
+    /// The name, read by the parser from the token at `span`.
+    pub fn read_from(self, span: TokenSpan) -> Self {
+        Self {
+            token: NameToken::Read(span),
+            ..self
+        }
+    }
+
+    /// A name with the value `value` in place of this one. It keeps the
+    /// token this name was read from, so the text of the token can be
+    /// replaced.
+    pub fn renamed(&self, value: impl Into<String>) -> Self {
+        let token = match self.token {
+            NameToken::Read(span) | NameToken::Replaces(span) => NameToken::Replaces(span),
+            NameToken::None => NameToken::None,
+        };
+        Self {
+            value: value.into(),
+            quote: None,
+            token,
+        }
+    }
+
+    /// How the name relates to the text that the parser read.
+    pub const fn token(&self) -> NameToken {
+        self.token
     }
 }
 

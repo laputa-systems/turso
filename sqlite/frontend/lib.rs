@@ -7,7 +7,7 @@
 mod schema_text;
 
 use std::{ops::Range, sync::Arc};
-use turso_core::{ast, Dialect, Result};
+use turso_core::{ast, dialect::RenameQuoting, Dialect, Result};
 use turso_parser::{lexer::Lexer, parser::Parser, token::TokenType};
 
 pub use turso_core::dialect::{SQLITE_VERSION, SQLITE_VERSION_NUMBER};
@@ -70,11 +70,25 @@ impl Dialect for SqliteDialect {
         Ok(schema_text::trigger_text(input).unwrap_or(canonical))
     }
 
+    fn format_view_sql(&self, input: &str, canonical: String) -> Result<String> {
+        Ok(schema_text::view_text(input).unwrap_or(canonical))
+    }
+
     fn added_column_text(&self, input: &str) -> Option<String> {
         schema_text::added_column_text(input)
     }
 
     fn table_sql_with_added_column(&self, sql: &str, column: &str) -> Option<String> {
         schema_text::table_sql_with_added_column(sql, column)
+    }
+
+    fn renamed_schema_sql(
+        &self,
+        sql: &str,
+        rewritten: &ast::Stmt,
+        rendered: String,
+        quoting: RenameQuoting,
+    ) -> Result<String> {
+        Ok(schema_text::renamed_text(sql, rewritten, quoting).unwrap_or(rendered))
     }
 }

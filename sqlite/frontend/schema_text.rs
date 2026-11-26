@@ -2,6 +2,8 @@
 //! creates an object: a fixed `CREATE <kind>` prefix followed by the
 //! statement as written, from the object's unqualified name onward.
 
+use turso_core::ast::{self, NameToken};
+use turso_core::dialect::RenameQuoting;
 use turso_parser::lexer::Lexer;
 use turso_parser::token::TokenType;
 
@@ -14,20 +16,32 @@ struct Located {
 fn tokens(sql: &str) -> Option<Vec<Located>> {
     let base = sql.as_ptr() as usize;
     let mut located = Vec::new();
-    for token in Lexer::new(sql.as_bytes()) {
-        let token = token.ok()?;
-        if token.token_type == TokenType::TK_NONE {
-            continue;
+    let mut offset = 0;
+    'lex: while offset < sql.len() {
+        for token in Lexer::new(&sql.as_bytes()[offset..]) {
+            let token = token.ok()?;
+            if token.token_type == TokenType::TK_NONE {
+                continue;
+            }
+            let Some(start) = (token.value.as_ptr() as usize).checked_sub(base) else { continue };
+            if start + token.value.len() > sql.len() {
+                continue;
+            }
+            // A bracket-quoted identifier runs to the next `]`, as the
+            // parser reads it; empty brackets are an array type suffix.
+            if token.token_type == TokenType::TK_LBRACKET && sql.as_bytes().get(start + 1) != Some(&b']') {
+                let end = start + 1 + sql[start + 1..].find(']')? + 1;
+                located.push(Located { kind: TokenType::TK_ID, start, end });
+                offset = end;
+                continue 'lex;
+            }
+            located.push(Located {
+                kind: token.token_type,
+                start,
+                end: start + token.value.len(),
+            });
         }
-        let Some(start) = (token.value.as_ptr() as usize).checked_sub(base) else { continue };
-        if start + token.value.len() > sql.len() {
-            continue;
-        }
-        located.push(Located {
-            kind: token.token_type,
-            start,
-            end: start + token.value.len(),
-        });
+        break;
     }
     Some(located)
 }
@@ -116,6 +130,19 @@ pub fn trigger_text(sql: &str) -> Option<String> {
     Some(format!("CREATE TRIGGER {}", &sql[tokens[name].start..end.end]))
 }
 
+pub fn view_text(sql: &str) -> Option<String> {
+    let tokens = tokens(sql)?;
+    let name = name_index(&tokens, TokenType::TK_VIEW)?;
+    let end = lookahead_end(sql, &tokens);
+    let text = sql[tokens[name].start..end].trim_end_matches(is_sqlite_space);
+    Some(format!("CREATE VIEW {text}"))
+}
+
+/// SQLite's `sqlite3Isspace`.
+fn is_sqlite_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
+
 pub fn added_column_text(sql: &str) -> Option<String> {
     let tokens = tokens(sql)?;
     let mut index = 0;
@@ -180,6 +207,49 @@ pub fn table_sql_with_added_column(sql: &str, column: &str) -> Option<String> {
     Some(format!("{}, {}{}", &sql[..offset], column, &sql[offset..]))
 }
 
+/// SQLite's `renameEditSql`: `sql` with the text of each token that a
+/// renamed name of `rewritten` replaces written as that name.
+pub fn renamed_text(sql: &str, rewritten: &ast::Stmt, quoting: RenameQuoting) -> Option<String> {
+    let mut replacements = Vec::new();
+    ast::fmt::for_each_name(rewritten, &mut |name| {
+        if let NameToken::Replaces(span) = name.token() {
+            replacements.push((span, name.as_str().to_string()));
+        }
+    })
+    .ok()?;
+    replacements.sort_by_key(|(span, _)| span.start);
+    replacements.dedup_by_key(|(span, _)| span.start);
+    let bytes = sql.as_bytes();
+    let mut text = String::with_capacity(sql.len());
+    let mut copied = 0;
+    for (span, name) in replacements {
+        if span.start < copied || span.end > sql.len() || !sql.is_char_boundary(span.start) || !sql.is_char_boundary(span.end) {
+            return None;
+        }
+        text.push_str(&sql[copied..span.start]);
+        if quoting == RenameQuoting::WhereQuoted && is_id_char(bytes[span.start]) {
+            text.push_str(&name);
+        } else {
+            text.push('"');
+            text.push_str(&name.replace('"', "\"\""));
+            text.push('"');
+            // SQLite keeps a space between the new name and a `"` that
+            // follows the replaced token.
+            if bytes.get(span.end) == Some(&b'"') {
+                text.push(' ');
+            }
+        }
+        copied = span.end;
+    }
+    text.push_str(&sql[copied..]);
+    Some(text)
+}
+
+/// SQLite's `sqlite3IsIdChar`.
+fn is_id_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +260,39 @@ mod tests {
         assert_eq!(table_text("CREATE TABLE \"x y\" (a)").as_deref(), Some("CREATE TABLE \"x y\" (a)"));
         assert_eq!(table_text("CREATE TABLE s(k PRIMARY KEY) WITHOUT ROWID ;").as_deref(), Some("CREATE TABLE s(k PRIMARY KEY) WITHOUT ROWID "));
         assert_eq!(table_text("CREATE TEMP TABLE t(a) STRICT").as_deref(), Some("CREATE TABLE t(a) STRICT"));
+    }
+
+    fn renamed_columns(sql: &str, new: &str, quoting: RenameQuoting) -> Option<String> {
+        let Some(ast::Cmd::Stmt(mut stmt)) = turso_parser::parser::Parser::new(sql.as_bytes()).next_cmd().unwrap() else {
+            panic!("not a statement");
+        };
+        let ast::Stmt::CreateTable { body: ast::CreateTableBody::ColumnsAndConstraints { columns, .. }, .. } = &mut stmt else {
+            panic!("not CREATE TABLE");
+        };
+        for column in columns {
+            column.col_name = column.col_name.renamed(new);
+        }
+        renamed_text(sql, &stmt, quoting)
+    }
+
+    #[test]
+    fn renamed_tokens_are_quoted_as_sqlite_quotes_them() {
+        assert_eq!(
+            renamed_columns("CREATE TABLE t(a, \"b\" INT, [c], d\"x\")", "n", RenameQuoting::WhereQuoted).as_deref(),
+            Some("CREATE TABLE t(n, \"n\" INT, \"n\", n\"x\")")
+        );
+        assert_eq!(
+            renamed_columns("CREATE TABLE t(a\"T\", b)", "x\"y", RenameQuoting::Always).as_deref(),
+            Some("CREATE TABLE t(\"x\"\"y\" \"T\", \"x\"\"y\")")
+        );
+    }
+
+    #[test]
+    fn bracket_quoted_names_end_at_the_bracket() {
+        assert_eq!(
+            table_text("CREATE TABLE \"u\"  (id INT, \"x\"\"y\" INT, CHECK ([x\"y] <> 1));").as_deref(),
+            Some("CREATE TABLE \"u\"  (id INT, \"x\"\"y\" INT, CHECK ([x\"y] <> 1))")
+        );
     }
 
     #[test]
@@ -208,6 +311,15 @@ mod tests {
             trigger_text("create temp trigger if not exists main.tr after insert on t begin select 1; end;").as_deref(),
             Some("CREATE TRIGGER tr after insert on t begin select 1; end")
         );
+    }
+
+    #[test]
+    fn view_text_keeps_comments_and_drops_trailing_space() {
+        assert_eq!(
+            view_text("create view if not exists main.v(x) as select a  from t -- hi\n ;").as_deref(),
+            Some("CREATE VIEW v(x) as select a  from t -- hi")
+        );
+        assert_eq!(view_text("CREATE TEMP VIEW w AS SELECT 1 /* c */  ").as_deref(), Some("CREATE VIEW w AS SELECT 1 /* c */"));
     }
 
     #[test]

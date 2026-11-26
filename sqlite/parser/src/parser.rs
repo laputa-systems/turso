@@ -15,8 +15,9 @@ use turso_ast::{
     Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
     ResultColumn, Select, SelectBody, SelectDistinctness, SelectTable, Set, SortOrder,
     SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent,
-    TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert,
-    UpsertDo, UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
+    TokenSpan, TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator,
+    Update, Upsert, UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
+    MAX_ARRAY_DIMENSIONS,
 };
 use turso_ast::{query_nested_too_deeply_message, MAX_QUERY_DEPTH};
 use turso_macros::match_ignore_ascii_case;
@@ -833,7 +834,22 @@ impl<'a> Parser<'a> {
             }
         }
         let tok = eat_expect!(self, TK_ID, TK_STRING, TK_INDEXED, TK_JOIN_KW);
-        Ok(Name::from_bytes(tok.as_bytes()))
+        Ok(self.name_from_token(tok.value))
+    }
+
+    /// The name that `token`, a slice of the input, spells.
+    fn name_from_token(&self, token: &[u8]) -> Name {
+        let name = Name::from_bytes(token);
+        let base = self.lexer.input.as_ptr() as usize;
+        match (token.as_ptr() as usize).checked_sub(base) {
+            Some(start) if start + token.len() <= self.lexer.input.len() => {
+                name.read_from(TokenSpan {
+                    start,
+                    end: start + token.len(),
+                })
+            }
+            _ => name,
+        }
     }
 
     /// After `peek()` returned `TK_LBRACKET`, report whether the brackets are
@@ -857,7 +873,10 @@ impl<'a> Parser<'a> {
         let name = String::from_utf8_lossy(raw).into_owned();
         // Advance lexer past the closing `]`
         self.lexer.offset = start + end_pos + 1;
-        Ok(Name::bracketed(name))
+        Ok(Name::bracketed(name).read_from(TokenSpan {
+            start: start - 1,
+            end: start + end_pos + 1,
+        }))
     }
 
     fn parse_transopt(&mut self) -> Result<Option<Name>> {
@@ -2139,13 +2158,13 @@ impl<'a> Parser<'a> {
         if let Some(second_name) = second_name {
             if let Some(third_name) = third_name {
                 Ok(Box::new(Expr::DoublyQualified(
-                    Name::from_bytes(name),
+                    self.name_from_token(name),
                     second_name,
                     third_name,
                 )))
             } else {
                 Ok(Box::new(Expr::Qualified(
-                    Name::from_bytes(name),
+                    self.name_from_token(name),
                     second_name,
                 )))
             }
@@ -2159,7 +2178,7 @@ impl<'a> Parser<'a> {
                 b"false" => {
                     Ok(Box::new(Expr::Literal(Literal::False)))
                 }
-                _ => Ok(Box::new(Expr::Id(Name::from_bytes(name)))),
+                _ => Ok(Box::new(Expr::Id(self.name_from_token(name)))),
             })
         }
     }
@@ -2628,7 +2647,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(self.parse_bracket_quoted_name()?));
         }
         let tok = eat_expect!(self, TK_ID, TK_STRING);
-        Ok(Some(Name::from_bytes(tok.as_bytes())))
+        Ok(Some(self.name_from_token(tok.value)))
     }
 
     fn parse_sort_order(&mut self) -> Result<Option<SortOrder>> {

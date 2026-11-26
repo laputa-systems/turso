@@ -25,7 +25,7 @@ use regex_syntax::hir::{
 
 use crate::ast::{self, Cmd, CreateTableBody, Privilege, QualifiedName, Stmt};
 use crate::dialect::{
-    Catalog, Dependent, Dialect, ScalarFuncContext, SortTermMatching,
+    Catalog, Dependent, Dialect, RenameQuoting, ScalarFuncContext, SortTermMatching,
 };
 use crate::function::{Func, ScalarFunc};
 use crate::namespace::NamespaceId;
@@ -122,12 +122,26 @@ impl Dialect for IcuDialect {
         self.inner.format_trigger_sql(input, canonical)
     }
 
+    fn format_view_sql(&self, input: &str, canonical: String) -> Result<String> {
+        self.inner.format_view_sql(input, canonical)
+    }
+
     fn added_column_text(&self, input: &str) -> Option<String> {
         self.inner.added_column_text(input)
     }
 
     fn table_sql_with_added_column(&self, sql: &str, column: &str) -> Option<String> {
         self.inner.table_sql_with_added_column(sql, column)
+    }
+
+    fn renamed_schema_sql(
+        &self,
+        sql: &str,
+        rewritten: &Stmt,
+        rendered: String,
+        quoting: RenameQuoting,
+    ) -> Result<String> {
+        self.inner.renamed_schema_sql(sql, rewritten, rendered, quoting)
     }
 
     fn schema_builder(&self, enable_custom_types: bool) -> Result<SchemaBuilder> {

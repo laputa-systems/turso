@@ -1,5 +1,6 @@
 use crate::alloc::TursoIteratorExt;
 use crate::ast;
+use crate::dialect::RenameQuoting;
 use crate::namespace::NamespaceId;
 use crate::schema::view::{extract_view_columns, ViewColumnSchema};
 use crate::translate::expr::{walk_expr_mut, WalkControl};
@@ -19,7 +20,7 @@ pub fn rewrite_fk_parent_cols_if_self_ref(
     if clause.tbl_name.as_str().eq_ignore_ascii_case(table) {
         for c in &mut clause.columns {
             if c.col_name.as_str().eq_ignore_ascii_case(from) {
-                c.col_name = ast::Name::exact(to.to_owned());
+                c.col_name = c.col_name.renamed(to);
             }
         }
     }
@@ -38,13 +39,12 @@ pub fn rename_identifiers(expr: &mut ast::Expr, from: &str, to: &str) {
                 ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
                     if name.as_str().eq_ignore_ascii_case(from) =>
                 {
-                    *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
+                    *e = ast::Expr::Id(name.renamed(to));
                 }
-                ast::Expr::Qualified(ref tbl, ref col_name)
+                ast::Expr::Qualified(_, ref mut col_name)
                     if col_name.as_str().eq_ignore_ascii_case(from) =>
                 {
-                    let tbl = tbl.clone();
-                    *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
+                    *col_name = col_name.renamed(to);
                 }
                 _ => {}
             }
@@ -74,6 +74,7 @@ mod rename_column_view {
         target_db_name: &str,
         old_column: &str,
         new_column: &str,
+        quoting: RenameQuoting,
     ) -> Result<Option<RewrittenView>> {
         let mut visiting_views = HashSet::default();
         rewrite_view_sql_for_column_rename_inner(
@@ -85,6 +86,7 @@ mod rename_column_view {
             target_db_name,
             old_column,
             new_column,
+            quoting,
             &mut visiting_views,
         )
     }
@@ -99,6 +101,7 @@ mod rename_column_view {
         target_db_name: &str,
         old_column: &str,
         new_column: &str,
+        quoting: RenameQuoting,
         visiting_views: &mut HashSet<String>,
     ) -> Result<Option<RewrittenView>> {
         let cmd = crate::dialect::parse_statement(dialect, view_sql)
@@ -161,7 +164,8 @@ mod rename_column_view {
                     columns: view_columns,
                     select: select.clone(),
                 };
-                new_stmt.to_string()
+                let rendered = new_stmt.to_string();
+                dialect.renamed_schema_sql(view_sql, &new_stmt, rendered, quoting)?
             } else {
                 view_sql.to_string()
             };
@@ -652,6 +656,7 @@ mod rename_column_view {
                             &ctx.target_db_norm,
                             ctx.old_column,
                             ctx.new_column,
+                            RenameQuoting::WhereQuoted,
                             visiting_views,
                         )? {
                             rename_map = build_rename_map_from_columns(
@@ -866,7 +871,7 @@ mod rename_column_view {
                     resolve_qualified(sources, &ns_norm, local_qualifiers);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
-                        *col = ast::Name::exact(name);
+                        *col = col.renamed(name);
                     });
                 }
                 if local_ambiguous {
@@ -876,7 +881,7 @@ mod rename_column_view {
                     let (source, ambiguous) = resolve_qualified(scope, &ns_norm, local_qualifiers);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
-                            *col = ast::Name::exact(name);
+                            *col = col.renamed(name);
                         });
                     }
                     if ambiguous {
@@ -897,7 +902,7 @@ mod rename_column_view {
                     resolve_qualified(sources, &ns_norm, std::slice::from_ref(&schema_norm));
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
-                        *col = ast::Name::exact(name);
+                        *col = col.renamed(name);
                     });
                 }
                 if local_ambiguous {
@@ -908,7 +913,7 @@ mod rename_column_view {
                         resolve_qualified(scope, &ns_norm, std::slice::from_ref(&schema_norm));
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
-                            *col = ast::Name::exact(name);
+                            *col = col.renamed(name);
                         });
                     }
                     if ambiguous {
@@ -920,11 +925,12 @@ mod rename_column_view {
                 if !col.as_str().eq_ignore_ascii_case(old_column_norm) {
                     return false;
                 }
+                let col = col.clone();
                 let col_norm = normalize_ident(col.as_str());
                 let (source, local_ambiguous) = resolve_unqualified(sources, &col_norm);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
-                        *expr = ast::Expr::Id(ast::Name::exact(name));
+                        *expr = ast::Expr::Id(col.renamed(name));
                     });
                 }
                 if local_ambiguous {
@@ -934,7 +940,7 @@ mod rename_column_view {
                     let (source, ambiguous) = resolve_unqualified(scope, &col_norm);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
-                            *expr = ast::Expr::Id(ast::Name::exact(name));
+                            *expr = ast::Expr::Id(col.renamed(name));
                         });
                     }
                     if ambiguous {
@@ -1008,7 +1014,7 @@ mod rename_column_view {
 
         for col in cols {
             if col.as_str().eq_ignore_ascii_case(old_column_norm) {
-                *col = ast::Name::exact(replacement.to_string());
+                *col = col.renamed(replacement);
                 changed = true;
             }
         }
@@ -1229,7 +1235,7 @@ pub fn rewrite_fk_parent_table_if_needed(
     new_tbl: &str,
 ) -> bool {
     if clause.tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
-        clause.tbl_name = ast::Name::exact(new_tbl.to_owned());
+        clause.tbl_name = clause.tbl_name.renamed(new_tbl);
         return true;
     }
     false
@@ -1267,7 +1273,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             ..
         } => {
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
-                *tbl_name = ast::Name::exact(new_tbl.to_owned());
+                *tbl_name = tbl_name.renamed(new_tbl);
             }
             let scope = TableRenameScope::new(old_tbl, new_tbl);
             let expr_scope = from
@@ -1290,7 +1296,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             ..
         } => {
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
-                *tbl_name = ast::Name::exact(new_tbl.to_owned());
+                *tbl_name = tbl_name.renamed(new_tbl);
             }
             rewrite_select_table_refs(select, old_tbl, new_tbl);
             if let Some(ref mut upsert) = upsert {
@@ -1302,7 +1308,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             where_clause,
         } => {
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
-                *tbl_name = ast::Name::exact(new_tbl.to_owned());
+                *tbl_name = tbl_name.renamed(new_tbl);
             }
             if let Some(ref mut wc) = where_clause {
                 rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
@@ -1532,7 +1538,7 @@ impl<'a> TableRenameScope<'a> {
     fn rewrite_table(&self, name: &mut ast::QualifiedName) {
         match self.new_qualifier {
             Some(qualifier) => name.namespace = Some(ast::Name::exact(qualifier.to_owned())),
-            None => name.name = self.new_name(),
+            None => name.name = self.renamed(&name.name),
         }
     }
 
@@ -1540,8 +1546,8 @@ impl<'a> TableRenameScope<'a> {
         name.as_str().eq_ignore_ascii_case(self.old_tbl)
     }
 
-    fn new_name(&self) -> ast::Name {
-        ast::Name::exact(self.new_tbl.to_owned())
+    fn renamed(&self, old: &ast::Name) -> ast::Name {
+        old.renamed(self.new_tbl)
     }
 }
 
@@ -1607,7 +1613,7 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, scope: TableRenameSco
                     }
                     ast::ResultColumn::TableStar(ref mut name) => {
                         if inner_scope.renames_qualifier(name) {
-                            *name = inner_scope.new_name();
+                            *name = inner_scope.renamed(name);
                         }
                     }
                     ast::ResultColumn::Star => {}
@@ -1662,7 +1668,7 @@ fn rewrite_select_table_entry_table_refs(
         }
         ast::SelectTable::TableCall(ref mut name, ref mut args, _) => {
             if scope.renames_table_function(name) {
-                name.name = scope.new_name();
+                name.name = scope.renamed(&name.name);
             }
             for arg in args {
                 rewrite_expr_table_refs(arg, from_scope);
@@ -1688,8 +1694,7 @@ fn rewrite_expr_table_refs(expr: &mut ast::Expr, scope: TableRenameScope) {
             match e {
                 ast::Expr::Qualified(tbl, col) => {
                     if scope.renames_qualifier(tbl) {
-                        let col = col.clone();
-                        *e = ast::Expr::Qualified(scope.new_name(), col);
+                        *tbl = scope.renamed(tbl);
                     }
                 }
                 ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {

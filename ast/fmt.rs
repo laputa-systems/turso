@@ -51,6 +51,8 @@ pub struct SqlWriter<'a> {
     write: &'a mut dyn Write,
     /// Whether the next piece is written without a space before it.
     spaced: bool,
+    /// Called with each name before it is written.
+    on_name: Option<&'a mut dyn FnMut(&Name)>,
 }
 
 impl<'a> SqlWriter<'a> {
@@ -59,7 +61,16 @@ impl<'a> SqlWriter<'a> {
         Self {
             write,
             spaced: true,
+            on_name: None,
         }
+    }
+
+    /// Writes a name.
+    pub fn name(&mut self, name: &Name) -> fmt::Result {
+        if let Some(on_name) = self.on_name.as_mut() {
+            on_name(name);
+        }
+        self.text(&name.as_ident())
     }
 
     /// Writes a keyword, such as `SELECT`.
@@ -1600,8 +1611,26 @@ impl WriteSql for GroupBy {
 impl_display_for_write_sql!(Name);
 impl WriteSql for Name {
     fn write_sql<C: ToSqlContext>(&self, s: &mut SqlWriter<'_>, _: &C) -> fmt::Result {
-        s.text(&self.as_ident())
+        s.name(self)
     }
+}
+
+/// Calls `on_name` with each name of `node` that its SQL text has, in the
+/// order of the text.
+pub fn for_each_name<T: WriteSql>(node: &T, on_name: &mut dyn FnMut(&Name)) -> fmt::Result {
+    struct Discard;
+    impl Write for Discard {
+        fn write_str(&mut self, _: &str) -> fmt::Result {
+            Ok(())
+        }
+    }
+    let mut discard = Discard;
+    let mut writer = SqlWriter {
+        write: &mut discard,
+        spaced: true,
+        on_name: Some(on_name),
+    };
+    node.write_sql(&mut writer, &BlankContext)
 }
 
 impl_display_for_write_sql!(QualifiedName);

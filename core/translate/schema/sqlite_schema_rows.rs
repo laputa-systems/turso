@@ -698,6 +698,7 @@ fn emit_create_view_row(
         view.columns,
         view.select,
     );
+    let sql = resolver.catalog.dialect.format_view_sql(view.statement, sql)?;
 
     let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
     emit_schema_entry(
