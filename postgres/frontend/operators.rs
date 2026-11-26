@@ -64,7 +64,7 @@ pub(crate) fn choose_operator(op: &str, operands: &[OperandType]) -> Result<Oper
     let Some(row) = OPERATORS.iter().find(takes_two) else {
         return Ok(OperatorChoice::LeftToTheEngine);
     };
-    if is_spelling_left_to_the_engine(literal, ty.oid) {
+    if is_spelling_left_to_the_engine(literal, ty) {
         return Ok(OperatorChoice::LeftToTheEngine);
     }
     check_number_literal(literal, ty)?;
@@ -121,7 +121,7 @@ pub(crate) fn choose_list_operator(
         .collect();
     let mut left_to_the_engine = literals.is_empty();
     for literal in literals {
-        if is_spelling_left_to_the_engine(literal, common) {
+        if is_spelling_left_to_the_engine(literal, ty) {
             left_to_the_engine = true;
         } else {
             check_number_literal(literal, ty)?;
@@ -226,8 +226,14 @@ fn is_run_by_core(op: &str, types: &[Option<Checked>]) -> bool {
 /// precision or a numeric, and a number with an exponent past the range of a
 /// double, which a numeric holds. The engine names a numeric REAL, like a
 /// double precision, so that exponent is not refused for either. The operator
-/// is left to the engine for these, as for any literal.
-fn is_spelling_left_to_the_engine(literal: &str, oid: i64) -> bool {
+/// is left to the engine for these, as for any literal. A registered float4 or
+/// float8 reads every spelling itself, so nothing is left to the engine.
+fn is_spelling_left_to_the_engine(literal: &str, ty: &Checked) -> bool {
+    let oid = ty.oid;
+    let is_registered_float = ty.engine.is_none() && [FLOAT4, FLOAT8].contains(&oid);
+    if is_registered_float {
+        return false;
+    }
     let text = literal.trim();
     let digits = text.trim_start_matches(['+', '-']);
     let lower = digits.to_ascii_lowercase();

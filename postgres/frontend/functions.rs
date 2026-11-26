@@ -1,6 +1,7 @@
 use crate::acl::{acl_role_name, Privileges as AclPrivileges};
 use crate::catalog::role_name_by_oid;
 use crate::error::sqlstate_error;
+use crate::pg_type::{float4_arithmetic, float4_negate, float8_arithmetic, float8_negate, FloatOp};
 use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, NaiveDateTime};
 use std::collections::HashSet;
@@ -394,6 +395,32 @@ fn register_scalar_functions(options: OpenOptions) -> OpenOptions {
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
+        "float4pl"(FunctionArity::Exact(2), true) => {
+            float4_arithmetic(args, FloatOp::Add)?
+        },
+        "float4mi"(FunctionArity::Exact(2), true) => {
+            float4_arithmetic(args, FloatOp::Subtract)?
+        },
+        "float4mul"(FunctionArity::Exact(2), true) => {
+            float4_arithmetic(args, FloatOp::Multiply)?
+        },
+        "float4div"(FunctionArity::Exact(2), true) => {
+            float4_arithmetic(args, FloatOp::Divide)?
+        },
+        "float4um"(FunctionArity::Exact(1), true) => float4_negate(args)?,
+        "float8pl"(FunctionArity::Exact(2), true) => {
+            float8_arithmetic(args, FloatOp::Add)?
+        },
+        "float8mi"(FunctionArity::Exact(2), true) => {
+            float8_arithmetic(args, FloatOp::Subtract)?
+        },
+        "float8mul"(FunctionArity::Exact(2), true) => {
+            float8_arithmetic(args, FloatOp::Multiply)?
+        },
+        "float8div"(FunctionArity::Exact(2), true) => {
+            float8_arithmetic(args, FloatOp::Divide)?
+        },
+        "float8um"(FunctionArity::Exact(1), true) => float8_negate(args)?,
         "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
         "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,

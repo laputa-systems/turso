@@ -1,0 +1,31 @@
+# Known tursopg gaps against PostgreSQL: aggregates on float4 and float8
+#
+# See errors.sqltest for how a gap test reads.
+
+@database :memory:
+
+@compat-gap "type:float8"
+test float8-sum-with-nan-is-nan {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('NaN'), (1.5);
+    SELECT sum(x) FROM t;
+}
+expect {
+    NaN
+}
+expect @tursopg {
+    1.5
+}
+
+@compat-gap "type:float8"
+test float8-sum-of-opposite-infinities-is-nan {
+    CREATE TABLE t (x float8);
+    INSERT INTO t VALUES ('Infinity'), ('-Infinity');
+    SELECT sum(x) FROM t;
+}
+expect {
+    NaN
+}
+expect @tursopg {
+    
+}

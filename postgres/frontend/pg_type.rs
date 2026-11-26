@@ -6,6 +6,9 @@
 mod boolean;
 mod float;
 
+pub(crate) use float::{
+    float4_arithmetic, float4_negate, float8_arithmetic, float8_negate, FloatOp,
+};
 pub use float::{read_pg_float, FloatInputError};
 
 use crate::session::relation_lookup_namespaces;
