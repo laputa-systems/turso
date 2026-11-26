@@ -1,0 +1,18 @@
+@database :memory:
+
+# PRAGMA case_sensitive_like was ignored. It replaces the LIKE function with
+# SQLite's built-in one, which compares the case of ASCII letters when the
+# value is true and ignores it when the value is false.
+
+test case-sensitive-like-switches-like {
+    SELECT 'a' LIKE 'A', like('A%', 'abc');
+    PRAGMA case_sensitive_like = 1;
+    SELECT 'a' LIKE 'A', like('A%', 'abc'), 'abc' LIKE 'a_c';
+    PRAGMA case_sensitive_like = 0;
+    SELECT 'a' LIKE 'A', like('A%', 'abc');
+}
+expect {
+    1|1
+    0|0|1
+    1|1
+}

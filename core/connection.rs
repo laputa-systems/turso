@@ -367,6 +367,19 @@ impl StorageStatsRead {
     }
 }
 
+/// The function that LIKE and `like()` run on a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LikeFunction {
+    /// The dialect's own, such as the one of SQLite's ICU extension.
+    Dialect,
+    /// SQLite's built-in one, which ignores the case of ASCII letters, as
+    /// `PRAGMA case_sensitive_like = 0` registers it.
+    CaseInsensitive,
+    /// SQLite's built-in one that compares case, as
+    /// `PRAGMA case_sensitive_like = 1` registers it.
+    CaseSensitive,
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -460,6 +473,8 @@ pub struct Connection {
     /// SQLite DQS misfeature: when ON (default), unresolved double-quoted identifiers
     /// in DML statements fall back to string literals instead of raising an error.
     pub(super) dqs_dml: AtomicBool,
+    /// The LIKE function of the connection, as a [`LikeFunction`].
+    pub(super) like_function: AtomicU8,
     /// Deprecated pragma: when ON, column names include table prefix (TABLE.COLUMN)
     pub(super) full_column_names: AtomicBool,
     /// Deprecated pragma: when ON (default), column refs use just the column name
@@ -3600,6 +3615,23 @@ impl Connection {
     pub fn set_dqs_dml(&self, value: bool) {
         self.dqs_dml.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    pub fn like_function(&self) -> LikeFunction {
+        match self.like_function.load(Ordering::SeqCst) {
+            0 => LikeFunction::Dialect,
+            1 => LikeFunction::CaseInsensitive,
+            _ => LikeFunction::CaseSensitive,
+        }
+    }
+
+    pub fn set_like_function(&self, function: LikeFunction) {
+        let value = match function {
+            LikeFunction::Dialect => 0,
+            LikeFunction::CaseInsensitive => 1,
+            LikeFunction::CaseSensitive => 2,
+        };
+        self.like_function.store(value, Ordering::SeqCst);
     }
 
     pub fn get_full_column_names(&self) -> bool {

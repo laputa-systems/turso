@@ -1552,6 +1552,24 @@ impl Value {
         Ok(pattern_compare(pattern, text, &LIKE_INFO, escape) == CompareResult::Match)
     }
 
+    /// LIKE that compares case, as SQLite's built-in `like()` after
+    /// `PRAGMA case_sensitive_like = 1`.
+    pub fn exec_like_case_sensitive(
+        pattern: &str,
+        text: &str,
+        escape: Option<char>,
+    ) -> Result<bool, LimboError> {
+        const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
+        if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
+            return Err(LimboError::SqlError(
+                "LIKE or GLOB pattern too complex".to_string(),
+            ));
+        }
+        let pattern = sqlite_text_prefix(pattern);
+        let text = sqlite_text_prefix(text);
+        Ok(pattern_compare(pattern, text, &LIKE_CASE_SENSITIVE_INFO, escape) == CompareResult::Match)
+    }
+
     pub fn exec_glob(pattern: &str, text: &str) -> Result<bool, LimboError> {
         const MAX_GLOB_PATTERN_LENGTH: usize = 50000;
         const GLOB_CHARS: [char; 3] = ['*', '?', '['];
@@ -2021,6 +2039,11 @@ const LIKE_INFO: PatternInfo = PatternInfo {
     match_one: '_',
     match_set: None,
     no_case: true,
+};
+
+const LIKE_CASE_SENSITIVE_INFO: PatternInfo = PatternInfo {
+    no_case: false,
+    ..LIKE_INFO
 };
 
 /// LIKE without an escape character over ASCII bytes: `_` matches one byte,

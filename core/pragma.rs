@@ -76,6 +76,9 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         EmptyResultCallbacks => {
             unreachable!("pragma_for() called with EmptyResultCallbacks, which is a no-op")
         }
+        CaseSensitiveLike => {
+            unreachable!("pragma_for() called with CaseSensitiveLike, which has no result")
+        }
         ModuleList => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::SchemaReq,
             &["module_list"],
@@ -279,6 +282,7 @@ impl PragmaVirtualTable {
                     && *name != PragmaName::FullColumnNames
                     && *name != PragmaName::ShortColumnNames
                     && *name != PragmaName::EmptyResultCallbacks
+                    && *name != PragmaName::CaseSensitiveLike
             })
             .filter_map(|name| {
                 let pragma = pragma_for(&name);

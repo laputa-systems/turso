@@ -24,6 +24,7 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::without_rowid::constraint_check_rank;
 use crate::translate::emitter::{Resolver, TransactionMode};
+use crate::LikeFunction;
 use crate::translate::plan::BitSet;
 use crate::util::{
     normalize_ident, parse_signed_number, parse_string, IOExt as _,
@@ -228,6 +229,28 @@ fn emit_table_list_rows_for_schema(
             false,
         );
     }
+}
+
+/// SQLite's `sqlite3GetBoolean(z, 0)`: a number is true when it is not
+/// zero, and of the words only `yes`, `on`, `true`, `full` and `extra` are
+/// true.
+fn sqlite_boolean(value: &ast::Expr) -> bool {
+    let text = match value {
+        Expr::Literal(Literal::Numeric(text) | Literal::String(text) | Literal::Keyword(text)) => {
+            text.as_str()
+        }
+        Expr::Name(name) | Expr::Id(name) => name.as_str(),
+        Expr::Literal(Literal::True) => return true,
+        _ => return false,
+    };
+    let text = text.trim_matches('\'');
+    if text.starts_with(|c: char| c.is_ascii_digit()) {
+        let digits = text.bytes().take_while(u8::is_ascii_digit);
+        return digits.fold(0i64, |n, d| n.saturating_mul(10).saturating_add(i64::from(d - b'0'))) != 0;
+    }
+    ["yes", "on", "true", "full", "extra"]
+        .iter()
+        .any(|word| text.eq_ignore_ascii_case(word))
 }
 
 /// SQLite matches PRAGMA names without regard to case.
@@ -482,6 +505,15 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::LegacyFileFormat | PragmaName::EmptyResultCallbacks => {
+            Ok(TransactionMode::None)
+        }
+        PragmaName::CaseSensitiveLike => {
+            // As sqlite3RegisterLikeFunctions, when the statement is prepared.
+            connection.set_like_function(if sqlite_boolean(&value) {
+                LikeFunction::CaseSensitive
+            } else {
+                LikeFunction::CaseInsensitive
+            });
             Ok(TransactionMode::None)
         }
         PragmaName::WalAutocheckpoint => {
@@ -1013,9 +1045,9 @@ fn query_pragma(
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
-        PragmaName::LegacyFileFormat | PragmaName::EmptyResultCallbacks => {
-            Ok(TransactionMode::None)
-        }
+        PragmaName::LegacyFileFormat
+        | PragmaName::EmptyResultCallbacks
+        | PragmaName::CaseSensitiveLike => Ok(TransactionMode::None),
         PragmaName::WalAutocheckpoint => {
             program.emit_int(i64::from(connection.get_wal_autocheckpoint()), register);
             program.emit_result_row(register, 1);

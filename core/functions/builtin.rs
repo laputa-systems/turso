@@ -2,6 +2,7 @@
 //! functions' code.
 
 use crate::dialect::ScalarFuncContext;
+use crate::LikeFunction;
 use crate::functions::datetime::{
     exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
     exec_strftime, exec_time, exec_timediff, exec_unixepoch,
@@ -535,11 +536,15 @@ pub fn call_builtin_scalar(
                 }
                 escape_char = c;
             }
+            let like = match connection.like_function() {
+                LikeFunction::CaseSensitive => Value::exec_like_case_sensitive,
+                LikeFunction::Dialect | LikeFunction::CaseInsensitive => Value::exec_like,
+            };
             let matches = match (pattern_value, match_value) {
                 (Value::Text(pattern), Value::Text(text)) => {
-                    Value::exec_like(pattern.as_str(), text.as_str(), escape_char)?
+                    like(pattern.as_str(), text.as_str(), escape_char)?
                 }
-                _ => exec_like_converted(pattern_value, match_value, escape_char)?,
+                _ => exec_like_converted(like, pattern_value, match_value, escape_char)?,
             };
             Ok(Value::from_i64(matches as i64))
         }
@@ -1373,13 +1378,14 @@ fn text_or_cast_to_text(value: &Value) -> crate::Result<Cow<'_, str>> {
 /// LIKE with an operand that is not TEXT: both are converted to TEXT first.
 #[inline(never)]
 fn exec_like_converted(
+    like: fn(&str, &str, Option<char>) -> crate::Result<bool>,
     pattern_value: &Value,
     match_value: &Value,
     escape_char: Option<char>,
 ) -> crate::Result<bool> {
     let pattern_cow = text_or_cast_to_text(pattern_value)?;
     let match_cow = text_or_cast_to_text(match_value)?;
-    Value::exec_like(&pattern_cow, &match_cow, escape_char)
+    like(&pattern_cow, &match_cow, escape_char)
 }
 
 fn check_arg_count(args: &[Register], expected: usize) -> crate::Result<()> {

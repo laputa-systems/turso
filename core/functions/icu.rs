@@ -34,7 +34,7 @@ use crate::schema::{BTreeTable, Schema, SchemaBuilder};
 use crate::security::policy::RowPolicy;
 use crate::security::roles::RoleId;
 use crate::vdbe::Register;
-use crate::{Connection, LimboError, OpenOptions, Result, Value};
+use crate::{Connection, LikeFunction, LimboError, OpenOptions, Result, Value};
 
 /// The longest LIKE pattern, in bytes, that the extension accepts. It is
 /// the extension's own default of SQLITE_MAX_LIKE_PATTERN_LENGTH.
@@ -172,7 +172,9 @@ impl Dialect for IcuDialect {
         match func {
             ScalarFunc::Upper => Ok(case_map(values(), Case::Upper)),
             ScalarFunc::Lower => Ok(case_map(values(), Case::Lower)),
-            ScalarFunc::Like => like(&values().collect::<Vec<_>>()),
+            ScalarFunc::Like if context.connection.like_function() == LikeFunction::Dialect => {
+                like(&values().collect::<Vec<_>>())
+            }
             _ => self.inner.call_scalar(context, func, args),
         }
     }

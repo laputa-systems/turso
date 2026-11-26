@@ -3309,6 +3309,7 @@ impl Database {
             query_timeout_ms: AtomicU64::new(0),
             interrupt_requested: AtomicBool::new(false),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
+            like_function: AtomicU8::new(0),
             full_column_names: AtomicBool::new(false),
             short_column_names: AtomicBool::new(true),
             #[cfg(feature = "simulator")]

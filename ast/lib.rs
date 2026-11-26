@@ -2460,6 +2460,9 @@ pub enum PragmaName {
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets
     EmptyResultCallbacks,
+    /// Deprecated: replace the LIKE function with SQLite's built-in one,
+    /// which compares case when the value is true
+    CaseSensitiveLike,
     /// VDBE opcode trace output
     VdbeTrace,
 }
