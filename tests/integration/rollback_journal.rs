@@ -647,7 +647,7 @@ fn new_database_becomes_wal_when_asked_before_the_first_write() {
 }
 
 #[test]
-fn open_pragmas_succeed_and_leave_unwritten_files_unchanged() {
+fn chromium_open_pragmas_succeed_and_leave_unwritten_files_unchanged() {
     let dir = TempDir::new().unwrap();
     let rollback_path = dir.path().join("rollback.db");
     python(PY_CREATE_LEGACY, &[&rollback_path]);
@@ -661,6 +661,7 @@ fn open_pragmas_succeed_and_leave_unwritten_files_unchanged() {
 
     for (db_path, journal_mode) in [(&rollback_path, "TRUNCATE"), (&wal_path, "WAL")] {
         let (db, conn) = open(db_path);
+        assert_eq!(single(&conn, "PRAGMA locking_mode=NORMAL"), "t:normal");
         rows(&conn, "PRAGMA page_size=4096");
         rows(&conn, "PRAGMA synchronous=OFF");
         rows(&conn, "PRAGMA synchronous=NORMAL");

@@ -438,6 +438,13 @@ fn update_pragma(
                 Expr::Literal(Literal::String(s)) => s.clone(),
                 _ => parse_string(&value)?,
             };
+            if connection.db.opts.enable_rollback_journal && mode.eq_ignore_ascii_case("normal") {
+                let register = program.alloc_register();
+                program.emit_string8("normal".to_string(), register);
+                program.emit_result_row(register, 1);
+                program.add_pragma_result_column(PragmaName::LockingMode.to_string());
+                return Ok(TransactionMode::None);
+            }
             let mode_bytes = mode.as_bytes();
             match_ignore_ascii_case!(match mode_bytes {
                 b"EXCLUSIVE" => {}
