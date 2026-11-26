@@ -4,7 +4,7 @@ use crate::alloc::TursoSliceExt;
 use crate::translate::expr_context::ExprContext;
 
 use crate::ast::{self, SortOrder, SubqueryType, TableInternalId};
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::{
     emitter::{OperationMode, Resolver, RowValueSubquery, RowValueSubqueryColumn, TranslateCtx},
@@ -87,6 +87,250 @@ pub(crate) fn materialized_from_clause_subquery_storage(
     }
 }
 
+/// Mark the CTE reads of a statement that share one stored result.
+///
+/// SQLite counts the reads of each CTE over the whole statement (`nUse`). When
+/// a CTE has two or more reads, the reads that SQLite does not merge into the
+/// query that reads them share one stored result. A read that SQLite merges
+/// computes the CTE again. Turso does not find for each read whether SQLite
+/// merges it. It uses the statement count only for a CTE whose body SQLite
+/// never merges into any query (see [sqlite_never_flattens_into_any_query]).
+/// A read of another CTE shares a stored result only with the other reads in
+/// the same query and its nested queries (see [count_shared_cte_references]).
+/// A CTE marked `NOT MATERIALIZED` is computed again for each read too, except
+/// that the reads in one FROM clause share one result
+/// (`fromClauseTermCanBeCoroutine` and `isSelfJoinView` in SQLite's select.c).
+///
+/// Reads that use the plan of an outer query reference
+/// ([FromClauseSubquery::uses_outer_reference_plan]) have the same cursors, so
+/// two of them must not run at the same time. They share one stored result
+/// when one query reads the CTE two or more times with its nested queries, also
+/// when SQLite would compute the CTE again for each of them. Reads in different
+/// subqueries run one after the other and compute the CTE again.
+///
+/// A read in a subquery or in a later compound arm is only known once the
+/// statement is planned, so [optimize_plan] calls this function.
+///
+/// `stores_every_read` is [Dialect::stores_cte_read_more_than_once]: every CTE
+/// read two or more times is stored, and `NOT MATERIALIZED` is not looked at.
+///
+/// [optimize_plan]: crate::translate::optimizer::optimize_plan
+/// [FromClauseSubquery::uses_outer_reference_plan]: crate::schema::FromClauseSubquery::uses_outer_reference_plan
+/// [Dialect::stores_cte_read_more_than_once]: crate::dialect::Dialect::stores_cte_read_more_than_once
+pub(crate) fn mark_shared_cte_materialization_requirements(
+    plan: &mut Plan,
+    stores_every_read: bool,
+) {
+    let mut stored_reads = HashMap::default();
+    count_stored_cte_reads(&mut stored_reads, plan, stores_every_read);
+    mark_stored_cte_reads(&stored_reads, plan, stores_every_read, &HashSet::default());
+}
+
+// Count the reads of each CTE in the statement, including reads in subqueries,
+// compound arms and CTE bodies. Reads of a CTE marked `NOT MATERIALIZED` are
+// not counted.
+//
+// A post-write RETURNING subquery runs after the write, so it reads the CTE
+// again unless an earlier read stored it. SQLite counts the RETURNING reads
+// only when it generates the RETURNING code, after the code of the reads before
+// the write, so they do not make the reads before the write share a result.
+// Its reads are counted only for the CTEs that the FROM clause of the
+// statement reads, because SQLite stores those before the write (`SF_UpdateFrom`
+// in `fromClauseTermCanBeCoroutine`) and RETURNING reuses them.
+fn count_stored_cte_reads(
+    stored_reads: &mut HashMap<usize, usize>,
+    plan: &mut Plan,
+    stores_every_read: bool,
+) {
+    let not_materialized = |from_clause_subquery: &crate::schema::FromClauseSubquery| {
+        !stores_every_read && from_clause_subquery.not_materialized_hint()
+    };
+    for_each_query_of_plan(plan, &mut |table_references, non_from_clause_subqueries| {
+        let mut from_clause_cte_ids = HashSet::default();
+        for table in table_references.joined_tables_mut().iter_mut() {
+            if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
+                let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+                if let Some(cte_id) = from_clause_subquery.cte_id() {
+                    if !not_materialized(from_clause_subquery) {
+                        *stored_reads.entry(cte_id).or_default() += 1;
+                        from_clause_cte_ids.insert(cte_id);
+                    }
+                }
+                count_stored_cte_reads(
+                    stored_reads,
+                    from_clause_subquery.plan.as_mut(),
+                    stores_every_read,
+                );
+            }
+        }
+
+        for subquery in non_from_clause_subqueries.iter_mut() {
+            let post_write_returning = subquery.origin.is_post_write_returning();
+            let SubqueryState::Unevaluated {
+                plan: Some(subquery_plan),
+            } = &mut subquery.state
+            else {
+                continue;
+            };
+            if !post_write_returning {
+                // SQLite computes an IN subquery from a copy of it
+                // (`sqlite3CodeRhsOfIN` in expr.c), and copying a CTE read
+                // counts one more read (`sqlite3SrcListDup`). So a CTE read in
+                // an IN subquery is stored even when it is the only read.
+                let copies = if matches!(subquery.query_type, SubqueryType::In { .. }) {
+                    2
+                } else {
+                    1
+                };
+                for _ in 0..copies {
+                    count_stored_cte_reads(stored_reads, subquery_plan, stores_every_read);
+                }
+            } else {
+                let mut returning_reads = HashMap::default();
+                count_stored_cte_reads(&mut returning_reads, subquery_plan, stores_every_read);
+                for (cte_id, returning_reads) in returning_reads {
+                    if from_clause_cte_ids.contains(&cte_id) {
+                        *stored_reads.entry(cte_id).or_default() += returning_reads;
+                    }
+                }
+            }
+        }
+    });
+}
+
+// Mark the CTE reads of `plan` that share one stored result.
+//
+// SQLite stores a `NOT MATERIALIZED` read that it does not merge when another
+// such read of the same CTE is in the same FROM clause. SQLite merges a simple
+// FROM clause subquery into the query that reads it before it looks at the
+// CTE reads, so the reads in such subqueries count as reads of that FROM clause.
+//
+// `stored_by_outer_queries` holds the CTEs that an enclosing query stores
+// before this query runs. A read of one of them reuses that result, as on main,
+// where such a read found the result by its CTE id.
+fn mark_stored_cte_reads(
+    stored_reads: &HashMap<usize, usize>,
+    plan: &mut Plan,
+    stores_every_read: bool,
+    stored_by_outer_queries: &HashSet<usize>,
+) {
+    let not_materialized = |from_clause_subquery: &crate::schema::FromClauseSubquery| {
+        !stores_every_read && from_clause_subquery.not_materialized_hint()
+    };
+    fn count_not_materialized_reads(
+        counts: &mut HashMap<usize, usize>,
+        table_references: &TableReferences,
+        not_materialized: &impl Fn(&crate::schema::FromClauseSubquery) -> bool,
+    ) {
+        for table in table_references.joined_tables() {
+            let Table::FromClauseSubquery(from_clause_subquery) = &table.table else {
+                continue;
+            };
+            match (
+                from_clause_subquery.cte_id(),
+                from_clause_subquery.plan.as_ref(),
+            ) {
+                (Some(cte_id), _) => {
+                    if not_materialized(from_clause_subquery) {
+                        *counts.entry(cte_id).or_default() += 1;
+                    }
+                }
+                (None, Plan::Select(select_plan)) => count_not_materialized_reads(
+                    counts,
+                    &select_plan.table_references,
+                    not_materialized,
+                ),
+                (None, _) => {}
+            }
+        }
+    }
+    for_each_query_of_plan(plan, &mut |table_references, non_from_clause_subqueries| {
+        let mut query_reads = HashMap::default();
+        count_shared_cte_references(
+            &mut query_reads,
+            table_references,
+            non_from_clause_subqueries,
+        );
+        let mut not_materialized_reads = HashMap::default();
+        count_not_materialized_reads(
+            &mut not_materialized_reads,
+            table_references,
+            &not_materialized,
+        );
+        let mut stored_here = stored_by_outer_queries.clone();
+        for table in table_references.joined_tables_mut().iter_mut() {
+            if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
+                let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+                let may_be_merged = !stores_every_read
+                    && !sqlite_never_flattens_into_any_query(from_clause_subquery);
+                if let Some(cte_id) = from_clause_subquery.cte_id() {
+                    let reads = if may_be_merged {
+                        query_reads.get(&cte_id).copied().unwrap_or_default()
+                    } else if not_materialized(from_clause_subquery) {
+                        not_materialized_reads
+                            .get(&cte_id)
+                            .copied()
+                            .unwrap_or_default()
+                    } else {
+                        stored_reads.get(&cte_id).copied().unwrap_or_default()
+                    };
+                    let shares_plan = from_clause_subquery.uses_outer_reference_plan()
+                        && query_reads.get(&cte_id).copied().unwrap_or_default() > 1;
+                    let shared =
+                        (reads > 1 || shares_plan || stored_by_outer_queries.contains(&cte_id))
+                            && !plan_has_outer_scope_dependency(&from_clause_subquery.plan);
+                    from_clause_subquery.set_shared_materialization(shared);
+                    if shared {
+                        stored_here.insert(cte_id);
+                    }
+                }
+            }
+        }
+        // A FROM clause subquery that is not a CTE read and a correlated
+        // subquery run after the CTEs of this FROM clause are stored. An
+        // uncorrelated subquery runs before them.
+        for table in table_references.joined_tables_mut().iter_mut() {
+            if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
+                let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+                let stored_before = if from_clause_subquery.cte_id().is_some() {
+                    stored_by_outer_queries
+                } else {
+                    &stored_here
+                };
+                mark_stored_cte_reads(
+                    stored_reads,
+                    from_clause_subquery.plan.as_mut(),
+                    stores_every_read,
+                    stored_before,
+                );
+            }
+        }
+        // The reads of RETURNING are marked when it is planned, by
+        // [mark_shared_cte_reads_of_subqueries].
+        for subquery in non_from_clause_subqueries.iter_mut() {
+            if subquery.origin.is_post_write_returning() {
+                continue;
+            }
+            let stored_before = if subquery.correlated {
+                &stored_here
+            } else {
+                stored_by_outer_queries
+            };
+            if let SubqueryState::Unevaluated {
+                plan: Some(subquery_plan),
+            } = &mut subquery.state
+            {
+                mark_stored_cte_reads(
+                    stored_reads,
+                    subquery_plan,
+                    stores_every_read,
+                    stored_before,
+                );
+            }
+        }
+    });
+}
+
 // Count the CTE reads in this query tree that can share one materialized
 // result.
 //
@@ -157,80 +401,104 @@ fn count_shared_cte_references_in_plan(counts: &mut HashMap<usize, usize>, plan:
     }
 }
 
-/// Mark CTE references that must be materialized once and shared across
-/// multiple reads of the same query tree.
-pub(crate) fn mark_shared_cte_materialization_requirements(
-    table_references: &mut TableReferences,
-    non_from_clause_subqueries: &mut [NonFromClauseSubquery],
+/// Mark the CTE reads of `subqueries` that share one stored result, counting
+/// the reads of all of them together: the subqueries of the RETURNING clause of
+/// a statement, or of the DO UPDATE of an UPSERT, which SQLite plans after the
+/// rest of the statement. A read that is stored before the write is reused too,
+/// because the stored result is found by its CTE.
+///
+/// SQLite resolves the RETURNING list twice (`codeReturning` in trigger.c), and
+/// each resolution counts a read, so a RETURNING read of a CTE that SQLite
+/// never merges is stored even when it is the only one. A correlated RETURNING
+/// subquery then reads the same result for every written row.
+///
+/// `stored_cte_ids` are the CTEs whose result the statement stored before
+/// these subqueries are planned, such as the CTEs that the SELECT of an INSERT
+/// stored. As in SQLite, a read of one of them that SQLite never merges reuses
+/// that result.
+pub(crate) fn mark_shared_cte_reads_of_subqueries<'a>(
+    subqueries: impl IntoIterator<Item = &'a mut NonFromClauseSubquery>,
+    stored_cte_ids: &[usize],
+    stores_every_read: bool,
 ) {
-    fn annotate_plan(plan: &mut Plan) {
-        match plan {
-            Plan::Select(select_plan) => mark_shared_cte_materialization_requirements(
-                &mut select_plan.table_references,
-                &mut select_plan.non_from_clause_subqueries,
-            ),
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                for (select_plan, _) in left.iter_mut() {
-                    mark_shared_cte_materialization_requirements(
-                        &mut select_plan.table_references,
-                        &mut select_plan.non_from_clause_subqueries,
-                    );
+    let mut plans: Vec<(&mut Plan, usize)> = subqueries
+        .into_iter()
+        .filter_map(|subquery| {
+            let resolutions = if subquery.origin.is_post_write_returning() {
+                2
+            } else {
+                1
+            };
+            match &mut subquery.state {
+                SubqueryState::Unevaluated { plan: Some(plan) } => {
+                    Some((plan.as_mut(), resolutions))
                 }
-                mark_shared_cte_materialization_requirements(
-                    &mut right_most.table_references,
-                    &mut right_most.non_from_clause_subqueries,
-                );
+                _ => None,
             }
-            Plan::RecursiveCte(recursive_cte) => {
-                annotate_plan(&mut recursive_cte.initial_query);
-                annotate_plan(&mut recursive_cte.recursive_query);
-            }
-            Plan::Delete(_) | Plan::Update(_) => {}
+        })
+        .collect();
+    // A stored result counts as two reads, so that one more read shares it.
+    let mut stored_reads: HashMap<usize, usize> =
+        stored_cte_ids.iter().map(|&cte_id| (cte_id, 2)).collect();
+    for (plan, resolutions) in plans.iter_mut() {
+        let mut plan_reads = HashMap::default();
+        count_stored_cte_reads(&mut plan_reads, plan, stores_every_read);
+        for (cte_id, plan_reads) in plan_reads {
+            *stored_reads.entry(cte_id).or_default() += plan_reads * *resolutions;
         }
     }
+    for (plan, _) in plans {
+        mark_stored_cte_reads(&stored_reads, plan, stores_every_read, &HashSet::default());
+    }
+}
 
-    let mut shared_ref_counts = HashMap::default();
-    count_shared_cte_references(
-        &mut shared_ref_counts,
-        table_references,
-        non_from_clause_subqueries,
-    );
-
-    for table in table_references.joined_tables_mut().iter_mut() {
-        if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
-            let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-            let shared_materialization = from_clause_subquery.cte_id().is_some_and(|cte_id| {
-                shared_ref_counts.get(&cte_id).copied().unwrap_or_default() > 1
-                    && !plan_has_outer_scope_dependency(&from_clause_subquery.plan)
-            });
-            from_clause_subquery.set_shared_materialization(shared_materialization);
-            if let Some(cte_id) = from_clause_subquery.cte_id() {
-                tracing::trace!(
-                    cte_id,
-                    shared_ref_count = shared_ref_counts.get(&cte_id).copied().unwrap_or_default(),
-                    shared_materialization,
-                    outer_scope_dependency = plan_has_outer_scope_dependency(
-                        &from_clause_subquery.plan,
-                    ),
-                    contains_nested_correlation = plan_is_correlated(&from_clause_subquery.plan),
-                    identifier = %table.identifier,
-                    "annotated CTE materialization requirements"
+/// Call `visit` with the table references and the subqueries of each query that
+/// `plan` runs itself: each arm of a compound SELECT, both parts of a recursive
+/// CTE, and the queries of an UPDATE or DELETE. Nested queries are not visited.
+fn for_each_query_of_plan(
+    plan: &mut Plan,
+    visit: &mut impl FnMut(&mut TableReferences, &mut [NonFromClauseSubquery]),
+) {
+    match plan {
+        Plan::Select(select_plan) => visit(
+            &mut select_plan.table_references,
+            &mut select_plan.non_from_clause_subqueries,
+        ),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            for (select_plan, _) in left.iter_mut() {
+                visit(
+                    &mut select_plan.table_references,
+                    &mut select_plan.non_from_clause_subqueries,
                 );
             }
-            annotate_plan(from_clause_subquery.plan.as_mut());
+            visit(
+                &mut right_most.table_references,
+                &mut right_most.non_from_clause_subqueries,
+            );
         }
-    }
-
-    for subquery in non_from_clause_subqueries.iter_mut() {
-        let SubqueryState::Unevaluated {
-            plan: Some(subquery_plan),
-        } = &mut subquery.state
-        else {
-            continue;
-        };
-        annotate_plan(subquery_plan);
+        Plan::RecursiveCte(recursive_cte) => {
+            for_each_query_of_plan(&mut recursive_cte.initial_query, visit);
+            for_each_query_of_plan(&mut recursive_cte.recursive_query, visit);
+        }
+        Plan::Delete(delete_plan) => {
+            if let Some(rowset_plan) = &mut delete_plan.rowset_plan {
+                visit(
+                    &mut rowset_plan.table_references,
+                    &mut rowset_plan.non_from_clause_subqueries,
+                );
+            }
+            // The table references of a DELETE hold only its target table.
+            visit(
+                &mut delete_plan.table_references,
+                &mut delete_plan.non_from_clause_subqueries,
+            );
+        }
+        Plan::Update(update_plan) => visit(
+            &mut update_plan.from_tables,
+            &mut update_plan.non_from_clause_subqueries,
+        ),
     }
 }
 
@@ -404,10 +672,6 @@ pub fn plan_subqueries_from_select_plan(
     }
 
     assign_select_subquery_eval_phases(plan, resolver)?;
-    mark_shared_cte_materialization_requirements(
-        &mut plan.table_references,
-        &mut plan.non_from_clause_subqueries,
-    );
 
     update_column_used_masks(
         &mut plan.table_references,
@@ -588,42 +852,63 @@ pub fn plan_subqueries_from_returning(
         &mut Vec::new(),
         &[],
     )?;
+    mark_shared_cte_reads_of_subqueries(
+        non_from_clause_subqueries.iter_mut(),
+        &[],
+        resolver.catalog.dialect.stores_cte_read_more_than_once(),
+    );
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
 }
 
-/// Compute query plans for subqueries in an UPSERT's DO UPDATE SET values or
-/// WHERE clause, which can reference the row of the target table that
-/// conflicted and the row that failed to insert.
+/// Compute query plans for subqueries in an UPSERT's DO UPDATE WHERE clause and
+/// SET values, which can reference the row of the target table that conflicted
+/// and the row that failed to insert. `stored_cte_ids` are the CTEs whose result
+/// the SELECT of the INSERT stored (see [mark_shared_cte_reads_of_subqueries]).
+#[allow(clippy::too_many_arguments)]
 pub fn plan_subqueries_from_upsert_do_update<'a>(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
     table_references: &mut TableReferences,
-    exprs: impl Iterator<Item = &'a mut ast::Expr>,
-    origin: SubqueryOrigin,
+    where_clause: Option<&'a mut ast::Expr>,
+    sets: impl Iterator<Item = &'a mut ast::Expr>,
+    stored_cte_ids: &[usize],
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let position = match origin {
-        SubqueryOrigin::DmlSet => SubqueryPosition::ResultColumn,
-        SubqueryOrigin::DmlWhere => SubqueryPosition::Where,
-        _ => unreachable!("DO UPDATE has only SET values and a WHERE clause"),
-    };
-    plan_subqueries_with_outer_query_access(
-        program,
-        non_from_clause_subqueries,
-        table_references,
-        resolver,
-        exprs,
-        connection,
-        position,
-        origin,
-        position.allow_correlated(),
-        &mut Vec::new(),
-        &mut Vec::new(),
-        &[],
-    )?;
+    for (position, origin, exprs) in [
+        (
+            SubqueryPosition::Where,
+            SubqueryOrigin::DmlWhere,
+            where_clause.into_iter().collect::<Vec<_>>(),
+        ),
+        (
+            SubqueryPosition::ResultColumn,
+            SubqueryOrigin::DmlSet,
+            sets.collect(),
+        ),
+    ] {
+        plan_subqueries_with_outer_query_access(
+            program,
+            non_from_clause_subqueries,
+            table_references,
+            resolver,
+            exprs.into_iter(),
+            connection,
+            position,
+            origin,
+            position.allow_correlated(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &[],
+        )?;
+    }
+    mark_shared_cte_reads_of_subqueries(
+        non_from_clause_subqueries.iter_mut(),
+        stored_cte_ids,
+        resolver.catalog.dialect.stores_cte_read_more_than_once(),
+    );
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
@@ -1516,15 +1801,13 @@ fn pre_materialize_multi_ref_ctes_in_tables(
             pre_materialize_multi_ref_ctes(program, from_clause_subquery.plan.as_mut(), t_ctx)?;
 
             // Then check if THIS CTE should be materialized
-            if let Some(cte_id) = from_clause_subquery.cte_id() {
+            if let Some(cte_id) = from_clause_subquery.stored_result_cte_id() {
                 if program.get_materialized_cte(cte_id).is_some() {
                     continue;
                 }
                 let reads_a_row_of_an_outer_query = query_level == QueryLevel::Nested
                     && plan_has_outer_scope_dependency(&from_clause_subquery.plan);
-                if from_clause_subquery.requires_table_materialization()
-                    && !reads_a_row_of_an_outer_query
-                    && !plan_is_correlated(&from_clause_subquery.plan)
+                if !reads_a_row_of_an_outer_query && !plan_is_correlated(&from_clause_subquery.plan)
                 {
                     tracing::trace!(
                         cte_id,
@@ -1575,7 +1858,9 @@ fn eqp_subquery_info(
         return None;
     };
     let cte_id = from_clause_subquery.cte_id();
-    let already_materialized = cte_id.is_some_and(|id| program.get_materialized_cte(id).is_some());
+    let already_materialized = from_clause_subquery
+        .stored_result_cte_id()
+        .is_some_and(|id| program.get_materialized_cte(id).is_some());
     let exec = if already_materialized {
         EqpSubqueryExec::MaterializedReuse
     } else {
@@ -1853,7 +2138,7 @@ fn reuse_materialized_cte(
     identifier: &str,
     internal_id: TableInternalId,
 ) -> bool {
-    let Some(cte_id) = from_clause_subquery.cte_id() else {
+    let Some(cte_id) = from_clause_subquery.stored_result_cte_id() else {
         return false;
     };
     let Some(cte_info) = program.get_materialized_cte(cte_id).cloned() else {
@@ -1930,7 +2215,9 @@ fn emit_from_clause_subquery_rows(
                 &from_clause_subquery.columns,
             )?;
             from_clause_subquery.materialized_cursor_id = Some(cursor_id);
-            if let (Some(cte_id), Some(cte_info)) = (from_clause_subquery.cte_id(), shared_table) {
+            if let (Some(cte_id), Some(cte_info)) =
+                (from_clause_subquery.stored_result_cte_id(), shared_table)
+            {
                 program.register_materialized_cte(cte_id, cte_info);
             }
             Some(result_columns_start)
@@ -2029,11 +2316,28 @@ fn coroutine_would_rerun_for_outer_rows(
 /// FROM term, whatever that outer query is. Only restrictions that depend on
 /// the subquery alone are checked, because SQLite may turn an outer join into
 /// an inner join before it flattens, which changes the restrictions that
-/// depend on the outer query.
+/// depend on the outer query. With more than one FROM term, a LIMIT keeps the
+/// subquery from being merged (8).
 fn sqlite_never_flattens_from_clause_subquery(table: &JoinedTable) -> bool {
     let Table::FromClauseSubquery(from_clause_subquery) = &table.table else {
         return false;
     };
+    let has_limit = match from_clause_subquery.plan.as_ref() {
+        Plan::Select(plan) => plan.limit.is_some(),
+        Plan::CompoundSelect { limit, .. } => limit.is_some(),
+        _ => false,
+    };
+    has_limit || sqlite_never_flattens_into_any_query(from_clause_subquery)
+}
+
+/// Whether SQLite's `flattenSubquery` (select.c) refuses to merge
+/// `from_clause_subquery` into any query that reads it. Only restrictions that
+/// depend on the subquery alone are checked. A LIMIT is not one of them,
+/// because SQLite merges a subquery with a LIMIT into a query that has one FROM
+/// term and no WHERE clause, aggregate, DISTINCT or LIMIT of its own.
+fn sqlite_never_flattens_into_any_query(
+    from_clause_subquery: &crate::schema::FromClauseSubquery,
+) -> bool {
     if from_clause_subquery.materialize_hint() {
         return true;
     }
@@ -2042,13 +2346,11 @@ fn sqlite_never_flattens_from_clause_subquery(table: &JoinedTable) -> bool {
         Plan::CompoundSelect {
             left,
             right_most,
-            limit,
             order_by,
             ..
         } => {
-            // Restrictions (8), (17a), (17b), (17c), (17e) and (20).
-            limit.is_some()
-                || order_by.is_some()
+            // Restrictions (17a), (17b), (17c), (17e) and (20).
+            order_by.is_some()
                 || left.iter().any(|(plan, operator)| {
                     !matches!(operator, ast::CompoundOperator::UnionAll)
                         || !select_core_can_be_flattened(plan)
@@ -2061,16 +2363,14 @@ fn sqlite_never_flattens_from_clause_subquery(table: &JoinedTable) -> bool {
 }
 
 /// Whether one SELECT of a FROM-clause subquery passes the restrictions of
-/// SQLite's `flattenSubquery` that depend only on that SELECT: it has no
-/// aggregate (checked by its caller in select.c), DISTINCT (4), window
-/// function (25), LIMIT (8, as the outer query has more than one FROM term),
-/// and it has a FROM clause (7).
+/// SQLite's `flattenSubquery` that depend only on that SELECT without its
+/// LIMIT: it has no aggregate (checked by its caller in select.c), DISTINCT
+/// (4), window function (25) or OFFSET (14), and it has a FROM clause (7).
 fn select_core_can_be_flattened(plan: &SelectPlan) -> bool {
     plan.aggregates.is_empty()
         && plan.group_by.is_none()
         && !plan.distinctness.is_distinct()
         && plan.window.is_none()
-        && plan.limit.is_none()
         && plan.offset.is_none()
         && !plan.joined_tables().is_empty()
 }

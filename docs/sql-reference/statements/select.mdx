@@ -471,6 +471,17 @@ WHERE total_sales > 100000
 ORDER BY total_sales DESC;
 ```
 
+As in SQLite, a CTE that the statement reads more than once is computed once for the statement, and the reads share the same rows, when SQLite never merges the CTE's query into a query that reads it: a CTE without a `FROM` clause, or with an aggregate, `DISTINCT`, a window function, `OFFSET`, `VALUES` or a compound other than `UNION ALL`. This includes reads in subqueries and in the arms of a compound SELECT. As in SQLite, a read in an `IN` subquery counts as two reads, because SQLite computes the subquery from a copy of it. Thus such a CTE is computed once even when the `IN` subquery is its only read, and a correlated `IN` subquery reads the same rows for each row of the outer query. A CTE marked `MATERIALIZED` is always computed once. A CTE marked `NOT MATERIALIZED` is computed again for each read, except that reads in the same `FROM` clause share one result.
+
+```sql
+WITH c(x) AS (SELECT random())
+SELECT x FROM c UNION SELECT x FROM c;   -- one row
+```
+
+SQLite merges a read of another CTE, for example a CTE that reads a table, into the query that reads it, and computes the CTE again there, unless a rule of its query flattener prevents it, for example a `LIMIT` in the CTE together with a `WHERE` clause in the reading query. Known difference: Turso does not apply these rules. It stores such a CTE for a read when the query of that read, with its nested queries, reads the CTE two or more times. A read in a correlated subquery or a `FROM` clause subquery of that query then reuses the stored result. Other reads compute the CTE again. Thus Turso can share one result where SQLite computes the CTE again, or the opposite. This changes the result only when the CTE gives different rows each time it runs, for example when it calls `random()`, or when the statement writes a table that the CTE reads.
+
+A subquery in the `RETURNING` clause of an `INSERT`, `UPDATE` or `DELETE` runs after the write. It runs again for each written row when it reads a column of the written row or when its own `FROM` clause names the written table. A read of the written table through a CTE, a `FROM` clause subquery or a nested subquery does not count, as in SQLite. Otherwise it runs once, after the first row is written. SQLite counts the reads in `RETURNING` only when it generates the `RETURNING` code, after the code of the reads before the write, so they do not make a read before the write store the CTE. A `RETURNING` subquery reuses the CTE result only when a read before the write stored it, as described above, including a read in an `IN` subquery, in the `FROM` clause of an `UPDATE`, or in the `SELECT` of an `INSERT ... SELECT`. Otherwise it computes the CTE again and sees the rows written so far, as in SQLite. The `RETURNING` subqueries of a statement share one CTE result among themselves, even a single subquery that reads a column of the written row: it reads the same result for every row. The subqueries in the `DO UPDATE` of an upsert share one result among themselves too, and reuse a result that the `SELECT` of the `INSERT` stored, but do not share one with `RETURNING`.
+
 ### Multiple CTEs
 
 ```sql
