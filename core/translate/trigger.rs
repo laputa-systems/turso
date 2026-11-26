@@ -100,6 +100,7 @@ pub fn translate_create_trigger(
     program: &mut ProgramBuilder,
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
+    input: &str,
 ) -> Result<()> {
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
     if is_reserved_object_name(
@@ -150,6 +151,7 @@ pub fn translate_create_trigger(
         when_clause,
         commands,
     );
+    let sql = resolver.catalog.dialect.format_trigger_sql(input, sql)?;
     let mangled_trigger_name = resolver.mangle_name(namespace, &normalized_trigger_name);
     // Temp triggers are allowed to reference tables in other databases.
     if target_table_database_id != database_id && database_id != crate::TEMP_DB_ID {

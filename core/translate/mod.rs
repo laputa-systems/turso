@@ -416,6 +416,7 @@ fn translate_statement(
             program,
             &commands,
             when_clause.as_deref(),
+            input,
         )?,
         ast::Stmt::CreateView {
             view_name,

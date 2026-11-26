@@ -109,6 +109,13 @@ pub fn index_text(sql: &str) -> Option<String> {
     Some(format!("{prefix} {}", &sql[tokens[name].start..end]))
 }
 
+pub fn trigger_text(sql: &str) -> Option<String> {
+    let tokens = tokens(sql)?;
+    let name = name_index(&tokens, TokenType::TK_TRIGGER)?;
+    let end = tokens.iter().rev().find(|token| token.kind == TokenType::TK_END)?;
+    Some(format!("CREATE TRIGGER {}", &sql[tokens[name].start..end.end]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +126,14 @@ mod tests {
         assert_eq!(table_text("CREATE TABLE \"x y\" (a)").as_deref(), Some("CREATE TABLE \"x y\" (a)"));
         assert_eq!(table_text("CREATE TABLE s(k PRIMARY KEY) WITHOUT ROWID ;").as_deref(), Some("CREATE TABLE s(k PRIMARY KEY) WITHOUT ROWID "));
         assert_eq!(table_text("CREATE TEMP TABLE t(a) STRICT").as_deref(), Some("CREATE TABLE t(a) STRICT"));
+    }
+
+    #[test]
+    fn trigger_text_ends_at_end() {
+        assert_eq!(
+            trigger_text("create temp trigger if not exists main.tr after insert on t begin select 1; end;").as_deref(),
+            Some("CREATE TRIGGER tr after insert on t begin select 1; end")
+        );
     }
 
     #[test]

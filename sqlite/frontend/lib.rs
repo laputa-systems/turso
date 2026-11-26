@@ -65,4 +65,8 @@ impl Dialect for SqliteDialect {
     fn format_index_sql(&self, input: &str, canonical: String) -> Result<String> {
         Ok(schema_text::index_text(input).unwrap_or(canonical))
     }
+
+    fn format_trigger_sql(&self, input: &str, canonical: String) -> Result<String> {
+        Ok(schema_text::trigger_text(input).unwrap_or(canonical))
+    }
 }
