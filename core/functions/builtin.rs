@@ -39,10 +39,10 @@ use std::sync::atomic::Ordering;
 /// This must equal `sqlite/version`, which `scripts/install-sqlite3.sh`
 /// reads; a test checks that, and that [`SQLITE_VERSION_NUMBER`] matches.
 /// Keep README.md and COMPAT.md in sync when bumping it.
-pub const SQLITE_VERSION: &str = "3.50.4";
+pub const SQLITE_VERSION: &str = "3.53.4";
 
 /// Integer form of [`SQLITE_VERSION`] used by `sqlite3_libversion_number()`.
-pub const SQLITE_VERSION_NUMBER: i32 = 3_050_004;
+pub const SQLITE_VERSION_NUMBER: i32 = 3_053_004;
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 use crate::function::FtsFunc;
