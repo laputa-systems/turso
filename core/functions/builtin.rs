@@ -501,6 +501,9 @@ pub fn call_builtin_scalar(
             }
             let pattern_value = args[0].get_value();
             let match_value = args[1].get_value();
+            if like_rejects_blobs(pattern_value, match_value) {
+                return Ok(Value::from_i64(0));
+            }
             if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
                 return Ok(Value::Null);
             }
@@ -517,6 +520,9 @@ pub fn call_builtin_scalar(
         ScalarFunc::Like => {
             let pattern_value = args[0].get_value();
             let match_value = args[1].get_value();
+            if like_rejects_blobs(pattern_value, match_value) {
+                return Ok(Value::from_i64(0));
+            }
             if matches!(pattern_value, Value::Null) || matches!(match_value, Value::Null) {
                 return Ok(Value::Null);
             }
@@ -1373,6 +1379,15 @@ fn text_or_cast_to_text(value: &Value) -> crate::Result<Cow<'_, str>> {
             _ => unreachable!("Cast to TEXT should yield Text"),
         },
     }
+}
+
+/// Whether the built-in LIKE and GLOB answer false without matching, as
+/// SQLite's `likeFunc` does for a BLOB argument when it is built with
+/// SQLITE_LIKE_DOESNT_MATCH_BLOBS, as Chromium builds it. The check comes
+/// before any other, so a BLOB with a NULL is false rather than NULL.
+fn like_rejects_blobs(pattern_value: &Value, match_value: &Value) -> bool {
+    cfg!(feature = "like_doesnt_match_blobs")
+        && (matches!(pattern_value, Value::Blob(_)) || matches!(match_value, Value::Blob(_)))
 }
 
 /// LIKE with an operand that is not TEXT: both are converted to TEXT first.

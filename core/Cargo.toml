@@ -34,6 +34,7 @@ baseline = [
 ]
 aegis = ["dep:aegis"]
 git-source-id = []
+like_doesnt_match_blobs = []
 secure_delete = []
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
