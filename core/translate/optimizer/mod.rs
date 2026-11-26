@@ -1669,6 +1669,11 @@ fn optimize_update_plan(
         .expect("UPDATE must optimize exactly one target table")
         .clone();
 
+    // A WITHOUT ROWID table always collects the primary keys of the rows to
+    // update before it writes them.
+    if plan.target_table.btree().is_some_and(|table| !table.has_rowid) {
+        return Ok(());
+    }
     if let Some(reason) = update_write_set_reason(plan, resolver, connection)? {
         plan.safety.require(reason);
     }

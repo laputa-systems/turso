@@ -10,6 +10,7 @@ use crate::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_index_column_value_old_image, emit_partial_index_where_old_image,
             emit_program_for_select, gencol::emit_row_from_cursor, get_triggers_including_temp,
+            without_rowid,
             has_triggers_including_temp, OperationMode, TriggerTime,
         },
         eqp::eqp_detail_for_table_op,
@@ -46,7 +47,15 @@ pub fn emit_program_for_delete(
     mut plan: DeletePlan,
 ) -> Result<()> {
     if !emit_clear_btree_delete(connection, resolver, program, &plan)? {
-        emit_row_loop_delete(connection, resolver, program, &mut plan)?;
+        let without_rowid_table = plan.table_references.joined_tables()[0]
+            .btree()
+            .filter(|table| !table.has_rowid);
+        match without_rowid_table {
+            Some(table) => without_rowid::emit_program_for_delete(
+                connection, resolver, program, &mut plan, &table,
+            )?,
+            None => emit_row_loop_delete(connection, resolver, program, &mut plan)?,
+        }
     }
 
     program.result_columns = plan.result_columns;

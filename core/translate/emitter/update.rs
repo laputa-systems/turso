@@ -105,6 +105,11 @@ pub fn emit_program_for_update(
     program: &mut ProgramBuilder,
     mut plan: UpdatePlan,
 ) -> Result<()> {
+    if let Some(table) = plan.target_table.btree().filter(|table| !table.has_rowid) {
+        return super::without_rowid::emit_program_for_update(
+            connection, resolver, program, plan, &table,
+        );
+    }
     program.set_resolve_type(plan.or_conflict.unwrap_or(ResolveType::Abort));
     program
         .flags
@@ -553,7 +558,7 @@ struct CdcUpdateRegisters {
 /// - everything else (ABORT/ROLLBACK/FAIL, or the default): halt with
 ///   `SQLITE_CONSTRAINT_NOTNULL`.
 #[allow(clippy::too_many_arguments)]
-fn emit_notnull_constraint_check(
+pub(super) fn emit_notnull_constraint_check(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
     target_reg: usize,
@@ -1006,7 +1011,7 @@ fn emit_update_column_values<'a>(
 }
 
 /// The UPDATE's OR clause wins over the column's own ON CONFLICT clause.
-fn notnull_conflict_resolution(program: &ProgramBuilder, table_column: &Column) -> ResolveType {
+pub(super) fn notnull_conflict_resolution(program: &ProgramBuilder, table_column: &Column) -> ResolveType {
     if program.flags.has_statement_conflict() {
         program.resolve_type
     } else {

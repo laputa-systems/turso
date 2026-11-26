@@ -53,9 +53,6 @@ fn validate_delete(
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
     }
-    if table.btree().is_some_and(|bt| !bt.has_rowid) {
-        crate::bail_parse_error!("DELETE from WITHOUT ROWID tables is not supported");
-    }
 
     // Check if this is a materialized view. Must look up the schema of the
     // table's own database: a table in an attached database can share a name
@@ -176,7 +173,9 @@ pub fn translate_delete(
         // Re-check after optimization: chosen access paths can make "delete while scanning"
         // unsafe, so we may need to collect rowids first.
         record_delete_optimizer_safety(delete_plan_inner, resolver, connection)?;
-        if delete_plan_inner.safety.requires_stable_write_set() {
+        if delete_plan_inner.safety.requires_stable_write_set()
+            && target_has_rowid(delete_plan_inner)
+        {
             ensure_delete_uses_rowset(program, delete_plan_inner);
         }
 
@@ -402,11 +401,19 @@ pub fn prepare_delete_plan(
         safety,
     };
 
-    if delete_plan.safety.requires_stable_write_set() {
+    if delete_plan.safety.requires_stable_write_set() && target_has_rowid(&delete_plan) {
         ensure_delete_uses_rowset(program, &mut delete_plan);
     }
 
     Ok(Plan::Delete(Box::new(delete_plan)))
+}
+
+/// Whether the DELETE target has rowids to collect in a RowSet. A WITHOUT
+/// ROWID table always collects its primary keys before it deletes.
+fn target_has_rowid(plan: &DeletePlan) -> bool {
+    plan.table_references.joined_tables()[0]
+        .btree()
+        .is_none_or(|table| table.has_rowid)
 }
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
