@@ -970,7 +970,8 @@ impl Value {
 
     /// trim(), ltrim() or rtrim() as SQLite's trimFunc computes them on
     /// bytes, when the text of the value or of the character set is not
-    /// UTF-8. None when both are UTF-8 or one is NULL.
+    /// UTF-8, or the character set has a NUL, where SQLite ends it. None
+    /// otherwise, and when one of them is NULL.
     fn trim_non_utf8(&self, pattern: Option<&Value>, trim_type: &TrimType) -> Option<Value> {
         let input = self.cast_text_bytes()?;
         let charset = match pattern {
@@ -978,7 +979,8 @@ impl Value {
             None => None,
         };
         let is_utf8 = |bytes: &[u8]| crate::types::validate_utf8(bytes).is_some();
-        if is_utf8(&input) && charset.as_deref().is_none_or(is_utf8) {
+        let plain_charset = |charset: &[u8]| is_utf8(charset) && first_nul(charset).is_none();
+        if is_utf8(&input) && charset.as_deref().is_none_or(plain_charset) {
             return None;
         }
         let characters: SmallVec<[&[u8]; 8]> = match charset.as_deref() {

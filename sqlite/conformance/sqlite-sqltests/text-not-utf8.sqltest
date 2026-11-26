@@ -54,3 +54,10 @@ expect {
     2
     617CFE7CFF7CFF
 }
+
+test trim-character-set-ends-at-nul {
+    SELECT hex(rtrim(CAST(x'327800' AS TEXT), CAST(x'0020' AS TEXT))), hex(trim(x'00412000', x'2000'));
+}
+expect {
+    327800|00412000
+}
