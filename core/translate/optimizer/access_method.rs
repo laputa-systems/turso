@@ -251,6 +251,7 @@ pub(super) fn choose_best_btree_candidate(
     };
     let mut best_adjusted_output = f64::MAX;
     let mut best_is_ordered = false;
+    let mut full_scans = Vec::new();
 
     // Build a mask for the rhs table itself.
     let mut rhs_table_mask = TableMask::default();
@@ -348,6 +349,13 @@ pub(super) fn choose_best_btree_candidate(
                 (IterationDirection::Forwards, false, Cost(0.0))
             };
 
+        if usable_constraint_refs.is_empty() {
+            full_scans.push(super::without_rowid_scan::FullScan {
+                index: candidate.index.clone(),
+                ordered: is_index_ordered,
+                iter_dir,
+            });
+        }
         if index_info.is_none() && !is_index_ordered {
             continue;
         }
@@ -494,17 +502,13 @@ pub(super) fn choose_best_btree_candidate(
         return Ok(None);
     }
     if let Some(table) = rhs_table.btree().filter(|table| !table.has_rowid) {
-        if best_choice.constraint_refs.is_empty() && !best_is_ordered {
-            best_choice.index = super::without_rowid_scan::full_scan_index(
-                rhs_table,
-                &table,
-                has_rowid_candidate,
-                rhs_constraints
-                    .candidates
-                    .iter()
-                    .filter_map(|candidate| candidate.index.as_ref()),
-            );
-            best_choice.iter_dir = IterationDirection::Forwards;
+        if best_choice.constraint_refs.is_empty() {
+            if let Some(scan) =
+                super::without_rowid_scan::sqlite_full_scan(rhs_table, &table, &full_scans)
+            {
+                best_choice.index = scan.index.clone();
+                best_choice.iter_dir = scan.iter_dir;
+            }
         }
     }
     Ok(Some(best_choice))

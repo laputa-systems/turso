@@ -1,4 +1,4 @@
-//! The index that SQLite scans for a full scan of a WITHOUT ROWID table.
+//! The b-tree that SQLite scans for a full scan of a WITHOUT ROWID table.
 //!
 //! SQLite's whereLoopAddBtree adds a full scan of every index of a WITHOUT
 //! ROWID table, the PRIMARY KEY index that is the table among them. A scan of
@@ -11,18 +11,27 @@
 use crate::schema::{BTreeTable, Column, Index};
 use crate::sync::Arc;
 use crate::translate::emitter::without_rowid::constraint_check_rank;
-use crate::translate::plan::JoinedTable;
+use crate::translate::plan::{IterationDirection, JoinedTable};
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 
-/// The index of `table` that SQLite scans when the query reads the table in
-/// full, of the table b-tree, for None, and the indexes of `candidates`.
-/// Returns None for the table b-tree.
-pub(crate) fn full_scan_index<'a>(
+/// A full scan of a WITHOUT ROWID table through its table b-tree, for None,
+/// or one of its indexes.
+#[derive(Debug, Clone)]
+pub(crate) struct FullScan {
+    pub(crate) index: Option<Arc<Index>>,
+    /// Whether the scan gives the rows in the order of the ORDER BY.
+    pub(crate) ordered: bool,
+    pub(crate) iter_dir: IterationDirection,
+}
+
+/// The full scan of `scans` that SQLite chooses. Sorting costs SQLite's
+/// solver more than any difference between two full scans, so a scan in the
+/// order of the ORDER BY wins over the others when there is one.
+pub(crate) fn sqlite_full_scan<'a>(
     joined_table: &JoinedTable,
     table: &BTreeTable,
-    table_is_candidate: bool,
-    candidates: impl Iterator<Item = &'a Arc<Index>>,
-) -> Option<Arc<Index>> {
+    scans: &'a [FullScan],
+) -> Option<&'a FullScan> {
     let table_width = table
         .columns()
         .iter()
@@ -34,44 +43,45 @@ pub(crate) fn full_scan_index<'a>(
         let rows: i64 = if partial { 190 } else { 200 };
         rows + 1 + (15 * log_est(width * 4)) / table_row
     };
-    let mut scans: Vec<(i64, Option<&Arc<Index>>)> = Vec::new();
-    if table_is_candidate {
-        let width = table
-            .columns()
-            .iter()
-            .filter(|column| !column.is_virtual_generated())
-            .map(column_size_estimate)
-            .sum();
-        scans.push((cost(width, false), None));
-    }
-    for index in candidates {
-        if index.index_method.is_some() {
-            continue;
-        }
-        let width = index
-            .columns
-            .iter()
-            .map(|column| match column.expression() {
-                Some(_) => 1,
-                None => column_size_estimate(&table.columns()[column.pos_in_table]),
-            })
-            .sum();
-        let partial = index.where_clause.is_some();
-        let scan_cost = if covers(joined_table, index) {
-            cost(width, partial)
-        } else {
-            let rows: i64 = if partial { 190 } else { 200 };
-            log_est_add(cost(width, partial), rows + 16)
+    let any_ordered = scans.iter().any(|scan| scan.ordered);
+    let mut costed: Vec<(i64, &FullScan)> = Vec::new();
+    for scan in scans.iter().filter(|scan| scan.ordered || !any_ordered) {
+        let scan_cost = match scan.index.as_deref() {
+            None => {
+                let width = table
+                    .columns()
+                    .iter()
+                    .filter(|column| !column.is_virtual_generated())
+                    .map(column_size_estimate)
+                    .sum();
+                cost(width, false)
+            }
+            Some(index) if index.index_method.is_some() => continue,
+            Some(index) => {
+                let width = index
+                    .columns
+                    .iter()
+                    .map(|column| match column.expression() {
+                        Some(_) => 1,
+                        None => column_size_estimate(&table.columns()[column.pos_in_table]),
+                    })
+                    .sum();
+                let partial = index.where_clause.is_some();
+                if covers(joined_table, index) {
+                    cost(width, partial)
+                } else {
+                    let rows: i64 = if partial { 190 } else { 200 };
+                    log_est_add(cost(width, partial), rows + 16)
+                }
+            }
         };
-        scans.push((scan_cost, Some(index)));
+        costed.push((scan_cost, scan));
     }
-    scans.sort_by_key(|(_, index)| constraint_check_rank(table, index.map(Arc::as_ref)));
-    let (_, index) = scans
+    costed.sort_by_key(|(_, scan)| constraint_check_rank(table, scan.index.as_deref()));
+    costed
         .iter()
         .min_by_key(|(cost, _)| *cost)
-        .copied()
-        .unwrap_or((0, None));
-    index.cloned()
+        .map(|(_, scan)| *scan)
 }
 
 /// Whether SQLite reads the columns that the query uses from `index` alone.

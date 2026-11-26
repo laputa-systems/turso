@@ -2498,7 +2498,7 @@ fn emit_rewrite_table_rows(
         db: database_id,
     });
 
-    program.cursor_loop(cursor_id, |program, rowid| -> Result<()> {
+    let rewrite_row = |program: &mut ProgramBuilder, rowid: usize| -> Result<()> {
         // Initialize all destination slots to NULL so that columns without a
         // source value (e.g. when a virtual generated column becomes stored,
         // there is no pre-existing value on the old row image) default to NULL.
@@ -2573,7 +2573,27 @@ fn emit_rewrite_table_rows(
             table_name: table_name.clone(),
         });
         Ok(())
-    })
+    };
+    if original_btree.has_rowid {
+        return program.cursor_loop(cursor_id, rewrite_row);
+    }
+    let loop_start = program.allocate_label();
+    let loop_end = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: loop_end,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    let unused_rowid_reg = program.alloc_register();
+    rewrite_row(program, unused_rowid_reg)?;
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: loop_start,
+        fullscan: false,
+        is_index: true,
+    });
+    program.preassign_label_to_next_insn(loop_end);
+    Ok(())
 }
 
 /// Convert the stored value of the altered column the same way INSERT
@@ -2642,9 +2662,8 @@ fn emit_strict_column_conversion(
 
 fn non_virtual_affinity_str(table: &BTreeTable) -> String {
     table
-        .columns()
+        .record_columns()
         .iter()
-        .filter(|col| !col.is_virtual_generated())
         .map(|col| col.affinity().aff_mask())
         .collect()
 }

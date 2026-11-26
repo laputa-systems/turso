@@ -6532,7 +6532,8 @@ impl BTreeTable {
     /// after the indexes of all its UNIQUE constraints. sqlite3AddPrimaryKey
     /// takes a PRIMARY KEY of one column of type INTEGER for the rowid, unless
     /// the column constraint says DESC, and convertToWithoutRowidTable makes
-    /// its index at the end.
+    /// its index at the end, unless a UNIQUE constraint on that column made
+    /// the same index before.
     pub fn without_rowid_primary_key_is_made_last(&self) -> bool {
         let [(name, order)] = self.primary_key_columns.as_slice() else {
             return false;
@@ -6544,6 +6545,9 @@ impl BTreeTable {
             && column.ty_str.eq_ignore_ascii_case("INTEGER")
             && column.ty_params.is_empty()
             && !(self.primary_key_is_inline && *order == SortOrder::Desc)
+            && !self.unique_sets.iter().any(|unique_set| {
+                !unique_set.is_primary_key && self.is_without_rowid_primary_key(unique_set)
+            })
     }
 
     /// The collation of PRIMARY KEY column `column_name`, which is `column`:
@@ -7906,6 +7910,24 @@ pub fn create_table(
         None
     };
 
+    // sqlite3AddPrimaryKey makes no index for a PRIMARY KEY that it takes for
+    // the rowid. In a WITHOUT ROWID table convertToWithoutRowidTable makes the
+    // index later, so a later UNIQUE constraint on the same column is the one
+    // that makes the index and gives it its number.
+    let primary_key_index_is_made_later = !has_rowid
+        && match primary_key_columns.as_slice() {
+            [(name, order)] => {
+                cols.iter().any(|column| {
+                    column
+                        .name
+                        .as_ref()
+                        .is_some_and(|column_name| column_name.eq_ignore_ascii_case(name))
+                        && column.ty_str.eq_ignore_ascii_case("INTEGER")
+                        && column.ty_params.is_empty()
+                }) && !(primary_key_is_inline && *order == SortOrder::Desc)
+            }
+            _ => false,
+        };
     let mut table = BTreeTable {
         root_page,
         name: table_name,
@@ -7925,7 +7947,7 @@ pub fn create_table(
             // Using a n^2 monkey algorithm here because n is small, CPUs are fast, life is short, and most importantly:
             // we want to preserve the order of the sets -- automatic index names in sqlite_schema must be in definition order.
             let mut i = 0;
-            while i < unique_sets.len() {
+            'sets: while i < unique_sets.len() {
                 let mut j = i + 1;
                 while j < unique_sets.len() {
                     let lengths_equal =
@@ -7948,6 +7970,13 @@ pub fn create_table(
                                     "conflicting ON CONFLICT clauses specified"
                                 );
                             }
+                        }
+                        if primary_key_index_is_made_later
+                            && unique_sets[i].is_primary_key
+                            && !unique_sets[j].is_primary_key
+                        {
+                            unique_sets.remove(i);
+                            continue 'sets;
                         }
                         unique_sets.remove(j);
                     } else {

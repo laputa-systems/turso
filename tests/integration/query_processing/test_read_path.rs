@@ -203,10 +203,9 @@ fn test_without_rowid_table_with_secondary_index(_tmp_db: TempDatabase) -> anyho
         assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows, "{query}");
     }
 
-    assert_that!(conn.prepare("SELECT c0 FROM t3 INDEXED BY t3_i0 WHERE c1 = 4"))
-        .err()
-        .display_string()
-        .contains("INDEXED BY is not supported on WITHOUT ROWID tables");
+    let indexed_query = "SELECT c0 FROM t3 INDEXED BY t3_i0 WHERE c1 = 4";
+    let sqlite_rows = sqlite_exec_rows(&SqliteConnection::open(&db_path)?, indexed_query);
+    assert_eq!(limbo_exec_rows(&conn, indexed_query), sqlite_rows, "{indexed_query}");
 
     Ok(())
 }

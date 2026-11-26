@@ -884,6 +884,36 @@ pub(super) fn btree_access_order_consumed(
         .position(|c| c.is_rowid_alias());
 
     match index {
+        None if table_ref.btree().is_some_and(|table| !table.has_rowid) => {
+            let table = table_ref.btree().expect("checked to be a b-tree table");
+            let primary_key = table
+                .primary_key_columns
+                .iter()
+                .filter_map(|(pk_name, order)| {
+                    let (pos_in_table, column) = table.get_column(pk_name)?;
+                    Some(IndexOrderColumn {
+                        pos_in_table,
+                        order: *order,
+                        nulls_order: None,
+                        collation: table.primary_key_collation(pk_name, column),
+                        expr: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let key_len = primary_key.len();
+            index_columns_order_consumed(
+                table_ref,
+                iter_dir,
+                constraint_refs,
+                order_target,
+                target_columns,
+                schema,
+                primary_key.into_iter(),
+                key_len,
+                false,
+                rowid_alias_col,
+            )
+        }
         None => {
             // Without an index, only rowid order is available.
             if first_target_col.table_id != table_ref.internal_id {

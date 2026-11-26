@@ -37,11 +37,13 @@ expect error {
     PRIMARY KEY missing on table t
 }
 
-test without-rowid-secondary-unique-rejected {
+test without-rowid-secondary-unique-enforced {
     CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER UNIQUE, c TEXT) WITHOUT ROWID;
+    INSERT INTO t VALUES ('k', 1, 'x');
+    INSERT INTO t VALUES ('m', 1, 'y');
 }
 expect error {
-    secondary UNIQUE constraints on WITHOUT ROWID tables are not supported
+    UNIQUE constraint failed: t.b
 }
 
 test without-rowid-autoincrement-rejected {
@@ -51,38 +53,45 @@ expect error {
     AUTOINCREMENT is not allowed on WITHOUT ROWID tables
 }
 
-test without-rowid-create-index-rejected {
+test without-rowid-create-index {
     CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
+    INSERT INTO t VALUES ('k', 2), ('m', 1);
     CREATE INDEX idx_t_b ON t(b);
+    SELECT * FROM t INDEXED BY idx_t_b;
 }
-expect error {
-    CREATE INDEX on WITHOUT ROWID tables is not supported
+expect {
+    m|1
+    k|2
 }
 
-test without-rowid-update-rejected {
+test without-rowid-update {
     CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
     INSERT INTO t VALUES ('k', 1);
     UPDATE t SET b = 2 WHERE a = 'k';
+    SELECT * FROM t;
 }
-expect error {
-    UPDATE of WITHOUT ROWID tables is not supported
+expect {
+    k|2
 }
 
-test without-rowid-delete-rejected {
+test without-rowid-delete {
     CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
-    INSERT INTO t VALUES ('k', 1);
+    INSERT INTO t VALUES ('k', 1), ('m', 2);
     DELETE FROM t WHERE a = 'k';
+    SELECT * FROM t;
 }
-expect error {
-    DELETE from WITHOUT ROWID tables is not supported
+expect {
+    m|2
 }
 
-test without-rowid-insert-or-replace-rejected {
+test without-rowid-insert-or-replace {
     CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID;
     INSERT OR REPLACE INTO t VALUES ('k', 1);
+    INSERT OR REPLACE INTO t VALUES ('k', 2);
+    SELECT * FROM t;
 }
-expect error {
-    UPSERT and REPLACE on WITHOUT ROWID tables are not supported
+expect {
+    k|2
 }
 
 test without-rowid-insert-or-ignore {
@@ -102,7 +111,7 @@ test without-rowid-upsert-rejected {
     INSERT INTO t VALUES ('k', 2) ON CONFLICT DO UPDATE SET b = excluded.b;
 }
 expect error {
-    UPSERT and REPLACE on WITHOUT ROWID tables are not supported
+    UPSERT on WITHOUT ROWID tables is not supported
 }
 
 test without-rowid-foreign-keys-rejected {

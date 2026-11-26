@@ -1,0 +1,301 @@
+@database :memory:
+@skip-file-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+
+@cross-check-integrity
+test without-rowid-create-index-on-existing-rows {
+    CREATE TABLE t(a TEXT, b INT, c, PRIMARY KEY(b DESC, a)) WITHOUT ROWID;
+    INSERT INTO t VALUES('x', 1, 30), ('y', 1, 10), ('z', 2, 20);
+    CREATE INDEX tc ON t(c);
+    SELECT * FROM t INDEXED BY tc;
+    PRAGMA integrity_check;
+}
+expect {
+    y|1|10
+    z|2|20
+    x|1|30
+    ok
+}
+
+@cross-check-integrity
+test without-rowid-index-key-ends-with-primary-key {
+    CREATE TABLE t(a, b, c, PRIMARY KEY(c, a DESC)) WITHOUT ROWID;
+    CREATE INDEX ib ON t(b);
+    CREATE INDEX iba ON t(b, a COLLATE NOCASE);
+    PRAGMA index_xinfo(ib);
+    PRAGMA index_xinfo(iba);
+    PRAGMA index_info(ib);
+}
+expect {
+    0|1|b|0|BINARY|1
+    1|2|c|0|BINARY|0
+    2|0|a|1|BINARY|0
+    0|1|b|0|BINARY|1
+    1|0|a|0|NOCASE|1
+    2|2|c|0|BINARY|0
+    3|0|a|1|BINARY|0
+    0|1|b
+}
+
+@cross-check-integrity
+test without-rowid-unique-constraint-index-keeps-primary-key-ascending {
+    CREATE TABLE t(a, b, PRIMARY KEY(a DESC), UNIQUE(b)) WITHOUT ROWID;
+    SELECT name FROM sqlite_schema;
+    PRAGMA index_xinfo(sqlite_autoindex_t_2);
+    PRAGMA index_list(t);
+}
+expect {
+    t
+    sqlite_autoindex_t_2
+    0|1|b|0|BINARY|1
+    1|0|a|0|BINARY|0
+    0|sqlite_autoindex_t_2|1|u|0
+    1|sqlite_autoindex_t_1|1|pk|0
+}
+
+@cross-check-integrity
+test without-rowid-integer-primary-key-index-is-numbered-last {
+    CREATE TABLE t(a INTEGER, b, c, PRIMARY KEY(a), UNIQUE(b), UNIQUE(c)) WITHOUT ROWID;
+    SELECT name FROM sqlite_schema;
+    PRAGMA index_list(t);
+}
+expect {
+    t
+    sqlite_autoindex_t_1
+    sqlite_autoindex_t_2
+    0|sqlite_autoindex_t_3|1|pk|0
+    1|sqlite_autoindex_t_2|1|u|0
+    2|sqlite_autoindex_t_1|1|u|0
+}
+
+@cross-check-integrity
+test without-rowid-secondary-unique-violation {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER UNIQUE, c TEXT) WITHOUT ROWID;
+    INSERT INTO t VALUES ('k', 1, 'x');
+    INSERT INTO t VALUES ('m', 1, 'y');
+}
+expect error {
+    UNIQUE constraint failed: t.b
+}
+
+@cross-check-integrity
+test without-rowid-insert-or-ignore-with-unique-index {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER UNIQUE, c TEXT) WITHOUT ROWID;
+    INSERT INTO t VALUES ('k', 1, 'x');
+    INSERT OR IGNORE INTO t VALUES ('m', 1, 'y'), ('n', 2, 'z'), ('k', 3, 'w');
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    k|1|x
+    n|2|z
+    ok
+}
+
+@cross-check-integrity
+test without-rowid-replace-deletes-rows-of-both-constraints {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER UNIQUE, c TEXT) WITHOUT ROWID;
+    CREATE INDEX tc ON t(c);
+    INSERT INTO t VALUES ('k', 1, 'x'), ('m', 2, 'y');
+    REPLACE INTO t VALUES ('k', 2, 'z');
+    SELECT changes();
+    SELECT * FROM t;
+    SELECT * FROM t INDEXED BY tc;
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    k|2|z
+    k|2|z
+    ok
+}
+
+@cross-check-integrity
+test without-rowid-update-changes-primary-key {
+    CREATE TABLE t(a, b, c, PRIMARY KEY(a, b)) WITHOUT ROWID;
+    CREATE INDEX tc ON t(c);
+    INSERT INTO t VALUES (1, 1, 'p'), (1, 2, 'q'), (2, 1, 'r');
+    UPDATE t SET b = b + 10 WHERE a = 1;
+    SELECT changes();
+    SELECT * FROM t;
+    SELECT * FROM t INDEXED BY tc;
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    1|11|p
+    1|12|q
+    2|1|r
+    1|11|p
+    1|12|q
+    2|1|r
+    ok
+}
+
+@cross-check-integrity
+test without-rowid-update-primary-key-conflict {
+    CREATE TABLE t(a PRIMARY KEY, b) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    UPDATE t SET a = 2 WHERE a = 1;
+}
+expect error {
+    UNIQUE constraint failed: t.a
+}
+
+@cross-check-integrity
+test without-rowid-update-or-replace-primary-key {
+    CREATE TABLE t(a PRIMARY KEY, b UNIQUE) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    UPDATE OR REPLACE t SET a = 2, b = 'z' WHERE a = 1;
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    2|z
+    ok
+}
+
+@cross-check-integrity
+test without-rowid-update-or-ignore-unique-index {
+    CREATE TABLE t(a PRIMARY KEY, b) WITHOUT ROWID;
+    CREATE UNIQUE INDEX tb ON t(b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE OR IGNORE t SET b = b + 10;
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|10
+    2|20
+    3|40
+    ok
+}
+
+@cross-check-integrity
+test without-rowid-delete-with-index {
+    CREATE TABLE t(a, b, c, PRIMARY KEY(b, a)) WITHOUT ROWID;
+    CREATE INDEX tc ON t(c) WHERE c > 1;
+    INSERT INTO t VALUES (1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 2, 4);
+    DELETE FROM t WHERE c IN (SELECT c FROM t WHERE c >= 3) OR a = 1;
+    SELECT changes();
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    3
+    2|1|2
+    ok
+}
+
+@cross-check-integrity
+test without-rowid-full-scan-uses-covering-index {
+    CREATE TABLE t(a TEXT, b INTEGER, PRIMARY KEY(a, b)) WITHOUT ROWID;
+    CREATE INDEX tb ON t(b);
+    INSERT INTO t VALUES ('x', 3), ('y', 1), ('z', 2);
+    SELECT * FROM t;
+}
+expect {
+    y|1
+    z|2
+    x|3
+}
+
+@cross-check-integrity
+test without-rowid-full-scan-skips-unique-constraint-index {
+    CREATE TABLE t(a, b, PRIMARY KEY(a), UNIQUE(b)) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 'c'), (2, 'a'), (3, 'b');
+    SELECT * FROM t;
+    SELECT * FROM t INDEXED BY sqlite_autoindex_t_2;
+}
+expect {
+    1|c
+    2|a
+    3|b
+    2|a
+    3|b
+    1|c
+}
+
+@cross-check-integrity
+test without-rowid-range-through-index {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INT, c) WITHOUT ROWID;
+    CREATE INDEX tb ON t(b DESC);
+    INSERT INTO t VALUES ('p', 5, 1), ('q', 3, 2), ('r', 9, 3), ('s', 3, 4);
+    SELECT a, c FROM t WHERE b BETWEEN 3 AND 5 ORDER BY a;
+    SELECT * FROM t INDEXED BY tb WHERE b < 9;
+}
+expect {
+    p|1
+    q|2
+    s|4
+    p|5|1
+    q|3|2
+    s|3|4
+}
+
+@cross-check-integrity
+test without-rowid-rollback-restores-indexes {
+    CREATE TABLE t(a PRIMARY KEY, b) WITHOUT ROWID;
+    CREATE INDEX tb ON t(b);
+    INSERT INTO t VALUES (1, 'x');
+    BEGIN;
+    INSERT INTO t VALUES (2, 'y');
+    UPDATE t SET b = 'z';
+    DELETE FROM t WHERE a = 1;
+    ROLLBACK;
+    SELECT * FROM t INDEXED BY tb;
+    PRAGMA integrity_check;
+}
+expect {
+    1|x
+    ok
+}
+
+@cross-check-integrity
+test without-rowid-drop-column-rewrites-rows {
+    CREATE TABLE v(d, a PRIMARY KEY, e) WITHOUT ROWID;
+    CREATE INDEX ve ON v(e);
+    INSERT INTO v VALUES (1, 2, 3), (2, 3, 4);
+    ALTER TABLE v DROP COLUMN d;
+    SELECT * FROM v;
+    SELECT * FROM v INDEXED BY ve;
+    PRAGMA integrity_check;
+}
+expect {
+    2|3
+    3|4
+    2|3
+    3|4
+    ok
+}
+
+@cross-check-integrity
+test without-rowid-integer-primary-key-merges-into-unique {
+    CREATE TABLE t(a INTEGER, b, c, PRIMARY KEY(a), UNIQUE(a), UNIQUE(b)) WITHOUT ROWID;
+    SELECT name FROM sqlite_schema;
+    PRAGMA index_list(t);
+}
+expect {
+    t
+    sqlite_autoindex_t_2
+    0|sqlite_autoindex_t_2|1|u|0
+    1|sqlite_autoindex_t_1|1|pk|0
+}
+
+@cross-check-integrity
+test without-rowid-order-by-primary-key {
+    CREATE TABLE t(a, b, c, PRIMARY KEY(a, b DESC)) WITHOUT ROWID;
+    CREATE INDEX tc ON t(c);
+    INSERT INTO t VALUES (1, 'a', 3), (1, 'b', 2), (2, 'a', 1), (1.0, 'c', 0);
+    SELECT a, b FROM t ORDER BY a;
+    SELECT a, b FROM t ORDER BY a DESC;
+}
+expect {
+    1.0|c
+    1|b
+    1|a
+    2|a
+    2|a
+    1|a
+    1|b
+    1.0|c
+}
