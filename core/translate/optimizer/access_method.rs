@@ -502,9 +502,30 @@ pub(super) fn choose_best_btree_candidate(
         return Ok(None);
     }
     if let Some(table) = rhs_table.btree().filter(|table| !table.has_rowid) {
-        if best_choice.constraint_refs.is_empty() {
+        let reader = if available_indexes.updates_without_rowid_table() {
+            super::without_rowid_scan::Reader::Update
+        } else {
+            super::without_rowid_scan::Reader::Select
+        };
+        let primary_key_serves_seek = has_rowid_candidate
+            && !best_is_ordered
+            && best_choice.index.as_deref().is_some_and(|index| {
+                !best_choice.constraint_refs.is_empty()
+                    && super::without_rowid_scan::primary_key_serves_seek(
+                        rhs_table,
+                        &table,
+                        index,
+                        &best_choice.constraint_refs,
+                        reader,
+                    )
+            });
+        if primary_key_serves_seek {
+            best_choice.index = None;
+            best_choice.constraint_refs = SmallVec::new();
+            best_choice.iter_dir = IterationDirection::Forwards;
+        } else if best_choice.constraint_refs.is_empty() {
             if let Some(scan) =
-                super::without_rowid_scan::sqlite_full_scan(rhs_table, &table, &full_scans)
+                super::without_rowid_scan::sqlite_full_scan(rhs_table, &table, &full_scans, reader)
             {
                 best_choice.index = scan.index.clone();
                 best_choice.iter_dir = scan.iter_dir;

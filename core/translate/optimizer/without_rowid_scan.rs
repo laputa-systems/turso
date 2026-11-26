@@ -11,8 +11,17 @@
 use crate::schema::{BTreeTable, Column, Index};
 use crate::sync::Arc;
 use crate::translate::emitter::without_rowid::constraint_check_rank;
+use crate::translate::optimizer::constraints::RangeConstraintRef;
 use crate::translate::plan::{IterationDirection, JoinedTable};
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
+
+/// The statement that reads a WITHOUT ROWID table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reader {
+    Select,
+    /// An UPDATE, whose loop SQLite never takes an index for covering.
+    Update,
+}
 
 /// A full scan of a WITHOUT ROWID table through its table b-tree, for None,
 /// or one of its indexes.
@@ -31,6 +40,7 @@ pub(crate) fn sqlite_full_scan<'a>(
     joined_table: &JoinedTable,
     table: &BTreeTable,
     scans: &'a [FullScan],
+    reader: Reader,
 ) -> Option<&'a FullScan> {
     let table_width = table
         .columns()
@@ -67,7 +77,7 @@ pub(crate) fn sqlite_full_scan<'a>(
                     })
                     .sum();
                 let partial = index.where_clause.is_some();
-                if covers(joined_table, index) {
+                if covers(joined_table, index, reader) {
                     cost(width, partial)
                 } else {
                     let rows: i64 = if partial { 190 } else { 200 };
@@ -84,11 +94,76 @@ pub(crate) fn sqlite_full_scan<'a>(
         .map(|(_, scan)| *scan)
 }
 
+/// Whether SQLite finds the rows that `index` finds through `constraint_refs`
+/// through the PRIMARY KEY of `table` instead. When the constraints are on
+/// the leading PRIMARY KEY columns with the same collations, the PRIMARY
+/// KEY finds the same rows without a lookup of each row, so it wins unless
+/// `index` covers the query and costs less by its width, or as much and
+/// comes first in the table's list of indexes.
+pub(crate) fn primary_key_serves_seek(
+    joined_table: &JoinedTable,
+    table: &BTreeTable,
+    index: &Index,
+    constraint_refs: &[RangeConstraintRef],
+    reader: Reader,
+) -> bool {
+    for (position, constraint) in constraint_refs.iter().enumerate() {
+        let Some((pk_name, _)) = table.primary_key_columns.get(position) else {
+            return false;
+        };
+        let Some((pk_position, pk_column)) = table.get_column(pk_name) else {
+            return false;
+        };
+        let Some(index_column) = index.columns.get(constraint.index_col_pos) else {
+            return false;
+        };
+        if constraint.index_col_pos != position
+            || index_column.expression().is_some()
+            || index_column.pos_in_table != pk_position
+            || index_column.collation != table.primary_key_collation(pk_name, pk_column)
+        {
+            return false;
+        }
+    }
+    if !covers(joined_table, index, reader) {
+        return true;
+    }
+    let table_width = table
+        .columns()
+        .iter()
+        .map(column_size_estimate)
+        .sum::<u64>()
+        + 1;
+    let table_row = log_est(table_width * 4);
+    let primary_key_width: u64 = table
+        .columns()
+        .iter()
+        .filter(|column| !column.is_virtual_generated())
+        .map(column_size_estimate)
+        .sum();
+    let index_width: u64 = index
+        .columns
+        .iter()
+        .map(|column| match column.expression() {
+            Some(_) => 1,
+            None => column_size_estimate(&table.columns()[column.pos_in_table]),
+        })
+        .sum();
+    let primary_key_cost = (15 * log_est(primary_key_width * 4)) / table_row;
+    let index_cost = (15 * log_est(index_width * 4)) / table_row;
+    primary_key_cost < index_cost
+        || (primary_key_cost == index_cost
+            && constraint_check_rank(table, None) < constraint_check_rank(table, Some(index)))
+}
+
 /// Whether SQLite reads the columns that the query uses from `index` alone.
 /// SQLite records which columns the index of a UNIQUE constraint holds
 /// before convertToWithoutRowidTable appends the PRIMARY KEY to it, so only
 /// the declared key of such an index counts.
-fn covers(joined_table: &JoinedTable, index: &Index) -> bool {
+fn covers(joined_table: &JoinedTable, index: &Index, reader: Reader) -> bool {
+    if reader == Reader::Update {
+        return false;
+    }
     if !index.name.starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX) {
         return joined_table.index_is_covering(index);
     }

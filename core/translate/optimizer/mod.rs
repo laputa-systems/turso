@@ -97,6 +97,10 @@ mod without_rowid_scan;
 #[derive(Debug, Default)]
 pub(crate) struct AvailableIndexes {
     indexes_by_table_id: HashMap<TableInternalId, VecDeque<Arc<Index>>>,
+    /// Whether the statement is an UPDATE of a WITHOUT ROWID table. SQLite's
+    /// whereLoopAddBtree then takes no index of the table for one that holds
+    /// every column the loop reads, since the loop has no SELECT.
+    updates_without_rowid_table: bool,
 }
 
 impl AvailableIndexes {
@@ -122,7 +126,12 @@ impl AvailableIndexes {
 
         Self {
             indexes_by_table_id,
+            updates_without_rowid_table: false,
         }
+    }
+
+    pub(crate) fn updates_without_rowid_table(&self) -> bool {
+        self.updates_without_rowid_table
     }
 
     pub(crate) fn indexes_for_table(
@@ -1620,7 +1629,9 @@ fn optimize_update_plan(
         TableReferences::for_update_target(plan.target_table.clone(), &plan.from_tables);
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
-    let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
+    let mut available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
+    available_indexes.updates_without_rowid_table =
+        plan.target_table.btree().is_some_and(|table| !table.has_rowid);
     rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition = eliminate_constant_conditions(
         &mut plan.where_clause,

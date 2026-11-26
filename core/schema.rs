@@ -6123,6 +6123,9 @@ impl BTreeTable {
     /// Whether `index` is the automatic index that enforces this table's
     /// PRIMARY KEY. An INTEGER PRIMARY KEY is the rowid and has no such index.
     pub fn is_primary_key_index(&self, index: &Index) -> bool {
+        if !self.has_rowid {
+            return index.root_page == self.root_page;
+        }
         self.get_rowid_alias_column().is_none()
             && index
                 .name
@@ -6503,11 +6506,17 @@ impl BTreeTable {
         !self.has_rowid
             && (unique_set.is_primary_key
                 || (unique_set.columns.len() == self.primary_key_columns.len()
-                    && unique_set
-                        .columns
-                        .iter()
-                        .zip(&self.primary_key_columns)
-                        .all(|(column, (pk_name, _))| column.name.eq_ignore_ascii_case(pk_name))))
+                    && unique_set.columns.iter().zip(&self.primary_key_columns).all(
+                        |(column, (pk_name, _))| {
+                            column.name.eq_ignore_ascii_case(pk_name)
+                                && self.get_column(pk_name).is_some_and(|(_, table_column)| {
+                                    column
+                                        .collation
+                                        .map_or_else(|| table_column.collation(), CollationSeq::Text)
+                                        == self.primary_key_collation(pk_name, table_column)
+                                })
+                        },
+                    )))
     }
 
     /// The number that ends the name SQLite gives the PRIMARY KEY index of a
@@ -6535,6 +6544,18 @@ impl BTreeTable {
     /// its index at the end, unless a UNIQUE constraint on that column made
     /// the same index before.
     pub fn without_rowid_primary_key_is_made_last(&self) -> bool {
+        self.without_rowid_primary_key_is_taken_for_rowid()
+            && !self.unique_sets.iter().any(|unique_set| {
+                !unique_set.is_primary_key && self.is_without_rowid_primary_key(unique_set)
+            })
+    }
+
+    /// Whether sqlite3AddPrimaryKey takes the PRIMARY KEY of this WITHOUT
+    /// ROWID table for the rowid: one column of type INTEGER, unless the
+    /// column constraint says DESC. convertToWithoutRowidTable makes its
+    /// index from the column name alone, without the COLLATE of the
+    /// constraint.
+    fn without_rowid_primary_key_is_taken_for_rowid(&self) -> bool {
         let [(name, order)] = self.primary_key_columns.as_slice() else {
             return false;
         };
@@ -6545,14 +6566,14 @@ impl BTreeTable {
             && column.ty_str.eq_ignore_ascii_case("INTEGER")
             && column.ty_params.is_empty()
             && !(self.primary_key_is_inline && *order == SortOrder::Desc)
-            && !self.unique_sets.iter().any(|unique_set| {
-                !unique_set.is_primary_key && self.is_without_rowid_primary_key(unique_set)
-            })
     }
 
     /// The collation of PRIMARY KEY column `column_name`, which is `column`:
     /// the one the PRIMARY KEY constraint names, else the column's own.
     pub fn primary_key_collation(&self, column_name: &str, column: &Column) -> CollationSeq {
+        if self.without_rowid_primary_key_is_taken_for_rowid() {
+            return column.collation();
+        }
         self.primary_key_constraint_collation(column_name)
             .map_or_else(|| column.collation(), CollationSeq::Text)
     }
@@ -7928,6 +7949,23 @@ pub fn create_table(
             }
             _ => false,
         };
+    // SQLite makes one index for two constraints on the same columns with the
+    // same collations, whatever their sort orders. The index of a PRIMARY KEY
+    // that SQLite takes for the rowid has no COLLATE of its own.
+    let constraint_collation = |unique_set: &UniqueSet, column: &UniqueSetColumn| {
+        let explicit = column
+            .collation
+            .filter(|_| !(primary_key_index_is_made_later && unique_set.is_primary_key));
+        explicit.map(CollationSeq::Text).or_else(|| {
+            cols.iter()
+                .find(|c| {
+                    c.name
+                        .as_ref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
+                })
+                .map(Column::collation)
+        })
+    };
     let mut table = BTreeTable {
         root_page,
         name: table_name,
@@ -7936,7 +7974,6 @@ pub fn create_table(
         primary_key_columns,
         primary_key_is_inline,
         has_autoincrement,
-        columns: cols,
         is_strict,
         foreign_keys,
         unique_sets: {
@@ -7957,7 +7994,11 @@ pub fn create_table(
                             .columns
                             .iter()
                             .zip(unique_sets[j].columns.iter())
-                            .all(|(a, b)| a.name.eq_ignore_ascii_case(&b.name))
+                            .all(|(a, b)| {
+                                a.name.eq_ignore_ascii_case(&b.name)
+                                    && constraint_collation(&unique_sets[i], a)
+                                        == constraint_collation(&unique_sets[j], b)
+                            })
                     {
                         // SQLite rejects duplicate constraints on the same columns when both
                         // specify ON CONFLICT with different resolve types.
@@ -7987,6 +8028,7 @@ pub fn create_table(
             }
             unique_sets
         },
+        columns: cols,
         check_constraints,
         rowid_alias_conflict_clause,
         primary_key_constraint_name,
@@ -7994,6 +8036,28 @@ pub fn create_table(
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
     };
+    // When the PRIMARY KEY and a UNIQUE constraint make the same index, SQLite
+    // keeps the index that it made first, with its sort orders.
+    if !table.has_rowid {
+        let merged_orders = table
+            .unique_sets
+            .iter()
+            .find(|unique_set| {
+                !unique_set.is_primary_key && table.is_without_rowid_primary_key(unique_set)
+            })
+            .map(|unique_set| {
+                unique_set
+                    .columns
+                    .iter()
+                    .map(|column| column.sort_order)
+                    .collect::<Vec<_>>()
+            });
+        if let Some(orders) = merged_orders {
+            for ((_, order), merged_order) in table.primary_key_columns.iter_mut().zip(orders) {
+                *order = merged_order;
+            }
+        }
+    }
     table.prepare_generated_columns()?;
     if table.is_strict {
         for column in table.columns.iter_mut() {
