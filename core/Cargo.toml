@@ -30,8 +30,10 @@ baseline = [
     "percentile",
     "autovacuum",
     "aegis",
+    "git-source-id",
 ]
 aegis = ["dep:aegis"]
+git-source-id = []
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
 # Harness-side observability: turns on aristo's instrument surface so the

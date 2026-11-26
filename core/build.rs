@@ -23,7 +23,8 @@ fn main() {
     // We use `git rev-parse --git-dir` instead of hardcoding ".git" to support worktrees,
     // where the git directory lives elsewhere (e.g., ../.git/worktrees/my-worktree).
     // Silently ignored if git unavailable (e.g., building from tarball).
-    let (git_hash, git_commit_epoch) = if source_date_epoch.is_some() {
+    let git_source_id = env::var_os("CARGO_FEATURE_GIT_SOURCE_ID").is_some();
+    let (git_hash, git_commit_epoch) = if source_date_epoch.is_some() || !git_source_id {
         (None, None)
     } else {
         // Resolve git dir dynamically to support worktrees.
@@ -64,6 +65,9 @@ fn main() {
     // Pre-format the timestamp so sqlite_source_id() doesn't need chrono at runtime.
     // Prefer SOURCE_DATE_EPOCH, then git commit time, and fall back to now.
     let sqlite_date = format_utc(source_date_epoch.or(git_commit_epoch).unwrap_or_else(|| {
+        if !git_source_id {
+            return 0;
+        }
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before epoch")
