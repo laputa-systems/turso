@@ -17,8 +17,8 @@ use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextC
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::expr_type::select_column_type;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_contains_function_that_changes_within_statement, expr_vector_size,
-    walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, expr_contains_function_that_changes_within_statement,
+    expr_reads_a_column, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -34,9 +34,12 @@ use crate::translate::result_row::emit_select_result;
 use crate::translate::row_security;
 use crate::translate::subquery::{
     plan_limit_offset_subqueries, plan_subqueries_from_select_plan, plan_subqueries_from_values,
+    report_result_column_subquery_errors,
 };
 use crate::translate::window::plan_windows;
-use crate::util::{exprs_are_equivalent, exprs_are_equivalent_as_written, normalize_ident};
+use crate::util::{
+    exprs_are_equivalent, exprs_are_equivalent_as_written, normalize_ident, walk_select_expressions,
+};
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
@@ -761,6 +764,27 @@ fn finish_select_plan(
     if plan.result_columns.len() > crate::types::MAX_COLUMN {
         crate::bail_parse_error!("too many columns in result set");
     }
+    // HAVING without GROUP BY needs an aggregate query. SQLite checks this
+    // right after it resolves the result columns, before WHERE, HAVING and
+    // ORDER BY, so the check runs here. An aggregate that a result-column
+    // subquery moves up to this query is only found when the subqueries are
+    // planned, so when a result-column subquery has an aggregate that can
+    // move up, the check runs after subquery planning instead.
+    let having_without_group_by = group_by
+        .as_ref()
+        .is_some_and(|gb| gb.exprs.is_empty() && gb.having.is_some());
+    let result_columns_compute_an_aggregate = aggregate_expressions
+        .iter()
+        .any(|agg| !aggregate_moves_to_enclosing_query(agg, &plan.table_references, resolver));
+    let only_subqueries_can_make_query_aggregate = having_without_group_by
+        && !result_columns_compute_an_aggregate
+        && !connection.dialect().having_makes_query_aggregate();
+    if only_subqueries_can_make_query_aggregate
+        && !result_column_subquery_may_move_aggregate_up(&plan.result_columns, resolver)?
+    {
+        report_result_column_subquery_errors(program, &mut plan, resolver, connection)?;
+        crate::bail_parse_error!("HAVING clause on a non-aggregate query");
+    }
 
     // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
     {
@@ -863,13 +887,6 @@ fn finish_select_plan(
         !(aggregate_belongs_to_enclosing_query(agg, tables)
             && resolver.move_aggregate_to_enclosing_query(agg.clone()))
     });
-
-    // HAVING without GROUP BY requires aggregates in the SELECT
-    if let Some(ref group_by) = plan.group_by {
-        if group_by.exprs.is_empty() && group_by.having.is_some() && plan.aggregates.is_empty() {
-            crate::bail_parse_error!("HAVING clause on a non-aggregate query");
-        }
-    }
 
     // Parse the ORDER BY clause
     let mut key = Vec::new();
@@ -1051,6 +1068,10 @@ fn finish_select_plan(
         (plan.limit, plan.offset) = limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
     }
 
+    // plan_windows moves the aggregates into the plan it builds, so
+    // whether the query has aggregates is read before it runs.
+    let has_aggregates_before_windows = !plan.aggregates.is_empty();
+
     if !windows.is_empty() {
         plan_windows(program, &mut plan, resolver, connection, &mut windows)?;
     }
@@ -1060,9 +1081,29 @@ fn finish_select_plan(
     // and ends after; the collected aggregates become this query's,
     // making it an aggregate query.
     resolver.begin_collecting_aggregates_from_subqueries();
-    plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
+    let result_column_subqueries_moved_an_aggregate =
+        plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
     let aggregates_from_subqueries = resolver.take_aggregates_from_subqueries();
     plan.aggregates.extend(aggregates_from_subqueries);
+
+    // HAVING without GROUP BY needs an aggregate query. This is checked
+    // after the subqueries are planned because an aggregate that a
+    // result-column subquery moves up to this query counts too.
+    if only_subqueries_can_make_query_aggregate && !result_column_subqueries_moved_an_aggregate {
+        crate::bail_parse_error!("HAVING clause on a non-aggregate query");
+    }
+    // In a dialect where HAVING alone makes the query an aggregate
+    // query, the emitter still runs a query without aggregates one row
+    // at a time and would skip HAVING.
+    if having_without_group_by
+        && connection.dialect().having_makes_query_aggregate()
+        && !has_aggregates_before_windows
+        && plan.aggregates.is_empty()
+    {
+        crate::bail_parse_error!(
+            "HAVING without GROUP BY in a query without aggregates is not supported"
+        );
+    }
 
     {
         trace_stack!("validate_plan");
@@ -1235,6 +1276,36 @@ pub(crate) fn first_aggregate_without_over_clause<'a>(
         }
         Ok(WalkControl::Continue)
     })?;
+    Ok(found)
+}
+
+/// Whether a subquery in the result columns has an aggregate call that reads a
+/// column. Such an aggregate may belong to this query when the column is this
+/// query's; an aggregate that reads no column always belongs to its own query.
+fn result_column_subquery_may_move_aggregate_up(
+    result_columns: &[ResultSetColumn],
+    resolver: &Resolver,
+) -> Result<bool> {
+    let mut found = false;
+    for rc in result_columns {
+        walk_expr(&rc.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+            let select = match e {
+                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => select,
+                ast::Expr::InSelect { rhs, .. } => rhs,
+                _ => return Ok(WalkControl::Continue),
+            };
+            walk_select_expressions(select, &mut |inner: &ast::Expr| -> Result<WalkControl> {
+                if !found
+                    && aggregate_call_name(inner, resolver).is_some()
+                    && expr_reads_a_column(inner)
+                {
+                    found = true;
+                }
+                Ok(WalkControl::Continue)
+            })?;
+            Ok(WalkControl::Continue)
+        })?;
+    }
     Ok(found)
 }
 
@@ -2163,6 +2234,17 @@ pub fn emit_simple_count(
         t_ctx.limit_ctx,
     )?;
     Ok(true)
+}
+
+/// Whether `agg` moves up to the enclosing query: its argument columns belong
+/// to that query and that query is collecting the aggregates of its subqueries.
+fn aggregate_moves_to_enclosing_query(
+    agg: &super::plan::Aggregate,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> bool {
+    aggregate_belongs_to_enclosing_query(agg, tables)
+        && resolver.is_collecting_aggregates_from_subqueries()
 }
 
 /// True when this aggregate belongs to the immediate enclosing query rather

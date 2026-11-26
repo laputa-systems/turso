@@ -287,7 +287,7 @@ fn operator_uses(expr: &mut ast::Expr) -> (Vec<&mut ast::Expr>, Vec<OperatorUse>
         ast::Expr::InList { lhs, not, rhs } => {
             let name = if *not { "<>" } else { "=" };
             let (with_columns, without_columns): (Vec<usize>, Vec<usize>) =
-                (1..=rhs.len()).partition(|&slot| reads_a_column(&rhs[slot - 1]));
+                (1..=rhs.len()).partition(|&slot| expr_reads_a_column(&rhs[slot - 1]));
             let mut uses = first_with_each(name, with_columns);
             if !without_columns.is_empty() {
                 let mut operands = vec![0];
@@ -368,26 +368,6 @@ fn first_with_each(
             kind: UseKind::Each,
         })
         .collect()
-}
-
-/// Whether `expr` reads a column of the query, as an item of an IN list does
-/// that PostgreSQL compares with the left side alone.
-fn reads_a_column(expr: &ast::Expr) -> bool {
-    let mut found = false;
-    let _ = walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-        found |= matches!(
-            expr,
-            ast::Expr::Column { .. }
-                | ast::Expr::RowId { .. }
-                | ast::Expr::MergedColumn(_)
-                | ast::Expr::Id(_)
-                | ast::Expr::Name(_)
-                | ast::Expr::Qualified(..)
-                | ast::Expr::DoublyQualified(..)
-        );
-        Ok(WalkControl::Continue)
-    });
-    found
 }
 
 fn comparison_symbol(op: &ast::Operator) -> Option<&'static str> {

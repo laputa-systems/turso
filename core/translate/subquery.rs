@@ -242,13 +242,16 @@ pub(crate) fn mark_shared_cte_materialization_requirements(
 /// The appropriate time is determined by whether the subquery is correlated or uncorrelated;
 /// if it is uncorrelated, it can be evaluated as early as possible, but if it is correlated, it must be evaluated after all of its dependencies from the
 /// outer query are 'in scope', i.e. their cursors are open and rewound.
+///
+/// Returns whether a subquery in the result columns moved an aggregate up to this query,
+/// which makes this query an aggregate query.
 #[turso_macros::trace_stack]
 pub fn plan_subqueries_from_select_plan(
     program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
     resolver: &Resolver,
     connection: &Arc<Connection>,
-) -> Result<()> {
+) -> Result<bool> {
     // Common-subexpression elimination for scalar subqueries shared by GROUP BY and the SELECT
     // list (e.g. `SELECT (subq) AS rs ... GROUP BY rs`, where the GROUP BY term is a copy of the
     // result column): plan and evaluate the subquery once instead of once per use.
@@ -342,23 +345,15 @@ pub fn plan_subqueries_from_select_plan(
     }
 
     // Result columns
-    {
-        crate::stack::trace_stack!("select_result_columns");
-        plan_subqueries_with_outer_query_access(
-            program,
-            &mut plan.non_from_clause_subqueries,
-            &mut plan.table_references,
-            resolver,
-            plan.result_columns.iter_mut().map(|c| &mut c.expr),
-            connection,
-            SubqueryPosition::ResultColumn,
-            SubqueryOrigin::SelectList,
-            SubqueryPosition::ResultColumn.allow_correlated(),
-            &mut cse_map,
-            &mut same_query_map,
-            &shared_subqueries,
-        )?;
-    }
+    let result_column_subqueries_moved_an_aggregate = plan_result_column_subqueries(
+        program,
+        plan,
+        resolver,
+        connection,
+        &mut cse_map,
+        &mut same_query_map,
+        &shared_subqueries,
+    )?;
 
     // ORDER BY
     {
@@ -413,7 +408,64 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
     )?;
-    Ok(())
+    Ok(result_column_subqueries_moved_an_aggregate)
+}
+
+/// Plan the result-column subqueries of `plan` only to report their errors.
+/// SQLite resolves the result columns before it checks the rest of the
+/// statement, so this lets a statement that fails to prepare anyway report
+/// the error that SQLite reports. Planning changes `plan` and `program`, so
+/// the caller must fail after this call.
+pub fn report_result_column_subquery_errors(
+    program: &mut ProgramBuilder,
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    resolver.begin_collecting_aggregates_from_subqueries();
+    let planned = plan_result_column_subqueries(
+        program,
+        plan,
+        resolver,
+        connection,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &[],
+    );
+    resolver.take_aggregates_from_subqueries();
+    planned.map(|_| ())
+}
+
+/// Compute query plans for subqueries in the result columns of `plan`. Returns
+/// whether those subqueries moved an aggregate up to the query that is
+/// collecting aggregates.
+#[allow(clippy::too_many_arguments)]
+fn plan_result_column_subqueries(
+    program: &mut ProgramBuilder,
+    plan: &mut SelectPlan,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
+    same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
+    shared_subqueries: &[ast::Expr],
+) -> Result<bool> {
+    crate::stack::trace_stack!("select_result_columns");
+    let aggregates_moved_before = resolver.count_aggregates_moved_from_subqueries();
+    plan_subqueries_with_outer_query_access(
+        program,
+        &mut plan.non_from_clause_subqueries,
+        &mut plan.table_references,
+        resolver,
+        plan.result_columns.iter_mut().map(|c| &mut c.expr),
+        connection,
+        SubqueryPosition::ResultColumn,
+        SubqueryOrigin::SelectList,
+        SubqueryPosition::ResultColumn.allow_correlated(),
+        cse_map,
+        same_query_map,
+        shared_subqueries,
+    )?;
+    Ok(resolver.count_aggregates_moved_from_subqueries() > aggregates_moved_before)
 }
 
 /// Compute query plans for subqueries in a LIMIT/OFFSET pair.
