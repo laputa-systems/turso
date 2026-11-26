@@ -1771,7 +1771,7 @@ fn rewrite_expr_table_refs(expr: &mut ast::Expr, scope: TableRenameScope) {
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
             match e {
-                ast::Expr::Qualified(tbl, col) => {
+                ast::Expr::Qualified(tbl, _) => {
                     if scope.renames_qualifier(tbl) {
                         *tbl = scope.renamed(tbl);
                     }
