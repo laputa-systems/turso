@@ -238,6 +238,13 @@ pub trait Dialect: Send + Sync + 'static {
         format_table_sql(tbl_name, body)
     }
 
+    /// Produce the SQL text to store in `sqlite_schema` for a
+    /// `CREATE INDEX`, given the statement as written and the canonical text
+    /// rendered from its AST. The default stores the canonical text.
+    fn format_index_sql(&self, _input: &str, canonical: String) -> Result<String> {
+        Ok(canonical)
+    }
+
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
     /// Schema rewrites cannot reuse the original frontend text because it no

@@ -4,6 +4,8 @@
 //! SQL and `sqlite_schema` rows are canonical SQLite text, parsed with the
 //! SQLite parser.
 
+mod schema_text;
+
 use std::{ops::Range, sync::Arc};
 use turso_core::{ast, Dialect, Result};
 use turso_parser::{lexer::Lexer, parser::Parser, token::TokenType};
@@ -46,5 +48,21 @@ impl Dialect for SqliteDialect {
 
     fn get_internal_dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(SqliteDialect)
+    }
+
+    fn format_table_sql(
+        &self,
+        input: &str,
+        tbl_name: &ast::QualifiedName,
+        body: &ast::CreateTableBody,
+    ) -> Result<String> {
+        match schema_text::table_text(input) {
+            Some(text) => Ok(text),
+            None => turso_core::dialect::format_table_sql(tbl_name, body),
+        }
+    }
+
+    fn format_index_sql(&self, input: &str, canonical: String) -> Result<String> {
+        Ok(schema_text::index_text(input).unwrap_or(canonical))
     }
 }

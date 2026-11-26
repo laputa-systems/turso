@@ -375,7 +375,7 @@ fn translate_statement(
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
+            translate_create_index(program, connection, resolver, stmt, input)?;
         }
         ast::Stmt::CreateTable {
             temporary,

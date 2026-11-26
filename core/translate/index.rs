@@ -102,6 +102,7 @@ pub fn translate_create_index(
     connection: &Arc<crate::Connection>,
     resolver: &Resolver,
     stmt: ast::Stmt,
+    input: &str,
 ) -> crate::Result<()> {
     let written_stmt = stmt.clone();
     let ast::Stmt::CreateIndex {
@@ -334,6 +335,7 @@ pub fn translate_create_index(
             table: &tbl_name,
             written_table: &original_tbl_name,
             statement: &written_stmt,
+            input,
             root_reg: root_page_reg,
         }),
     )?;

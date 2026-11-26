@@ -250,6 +250,7 @@ pub struct CreateIndex<'a> {
     pub table: &'a str,
     pub written_table: &'a ast::Name,
     pub statement: &'a ast::Stmt,
+    pub input: &'a str,
     pub root_reg: usize,
 }
 

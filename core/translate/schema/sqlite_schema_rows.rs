@@ -164,11 +164,14 @@ fn emit_create_index_row(
         id: index.namespace,
     };
     let stored_name = resolver.mangle_name(namespace, index.name);
-    let sql = canonical_create_index_sql(
-        index.statement,
-        resolver.name_in_sql(namespace, index.written_name),
-        resolver.name_in_sql(namespace, index.written_table),
-    );
+    let sql = resolver.catalog.dialect.format_index_sql(
+        index.input,
+        canonical_create_index_sql(
+            index.statement,
+            resolver.name_in_sql(namespace, index.written_name),
+            resolver.name_in_sql(namespace, index.written_table),
+        ),
+    )?;
 
     let sqlite_schema_cursor_id = ctx.sqlite_schema_cursor(program);
     let cdc_table = prepare_cdc_if_necessary(
