@@ -3160,6 +3160,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgOperatorTable>(PhantomData),
     );
+    options = options.native_module(
+        "pg_aggregate",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgAggregateTable>(PhantomData),
+    );
     for (name, create_sql) in [
         (
             "pg_opclass",
@@ -3363,6 +3368,70 @@ impl SnapshotRows for PgOperatorTable {
                     Value::from_i64(NO_FUNCTION),
                     Value::from_i64(NO_FUNCTION),
                     Value::from_i64(NO_FUNCTION),
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgAggregateTable;
+
+impl SnapshotRows for PgAggregateTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_aggregate (
+        aggfnoid INTEGER, aggkind TEXT, aggnumdirectargs INTEGER, aggtransfn INTEGER,
+        aggfinalfn INTEGER, aggcombinefn INTEGER, aggserialfn INTEGER, aggdeserialfn INTEGER,
+        aggmtransfn INTEGER, aggminvtransfn INTEGER, aggmfinalfn INTEGER,
+        aggfinalextra BOOLEAN, aggmfinalextra BOOLEAN, aggfinalmodify TEXT,
+        aggmfinalmodify TEXT, aggsortop INTEGER, aggtranstype INTEGER, aggtransspace INTEGER,
+        aggmtranstype INTEGER, aggmtransspace INTEGER, agginitval TEXT, aggminitval TEXT,
+        tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2600);
+    const ESTIMATED_COST: f64 = 10.0;
+    const ESTIMATED_ROWS: u32 = 50;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        // FIXME(pg-catalog): The function columns are 0, because pg_proc does not list the support functions of PostgreSQL, such as int4_sum and int8inc, under their oids.
+        const NO_FUNCTION: i64 = 0;
+        crate::aggregates::AGGREGATES
+            .iter()
+            .map(|aggregate| {
+                let sort_operator_is_listed = crate::operators::OPERATORS
+                    .iter()
+                    .any(|operator| operator.oid == aggregate.sort_operator);
+                let sort_operator = if sort_operator_is_listed {
+                    aggregate.sort_operator
+                } else {
+                    0
+                };
+                vec![
+                    Value::from_i64(aggregate.oid),
+                    Value::build_text(aggregate.kind),
+                    Value::from_i64(aggregate.direct_args),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(NO_FUNCTION),
+                    Value::from_i64(i64::from(aggregate.final_extra)),
+                    Value::from_i64(i64::from(aggregate.moving_final_extra)),
+                    Value::build_text(aggregate.final_modify),
+                    Value::build_text(aggregate.moving_final_modify),
+                    Value::from_i64(sort_operator),
+                    Value::from_i64(aggregate.state_type),
+                    Value::from_i64(aggregate.state_space),
+                    Value::from_i64(aggregate.moving_state_type),
+                    Value::from_i64(aggregate.moving_state_space),
+                    aggregate
+                        .initial_value
+                        .map_or(Value::Null, Value::build_text),
+                    aggregate
+                        .moving_initial_value
+                        .map_or(Value::Null, Value::build_text),
                 ]
             })
             .collect()

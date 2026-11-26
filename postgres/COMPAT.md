@@ -120,6 +120,13 @@ accepts, `abs` for the six number types, and `now`, `quote_ident`,
 `format_type`, `pg_get_constraintdef` and `pg_is_in_recovery`. It does not list
 the other functions of PostgreSQL, and it does not list any function that
 only tursopg has.
+`pg_aggregate` has the rows of PostgreSQL 18 for the 46 aggregates of `pg_proc`,
+with `aggfnoid` equal to the `pg_proc` oid. Its function columns (`aggtransfn`,
+`aggfinalfn` and the others) are 0, because `pg_proc` does not list support
+functions such as `int4_sum` under their oids. `aggsortop` is 0 when
+`pg_operator` has no row for the operator, such as the operators of oid and
+bytea. `aggtranstype` names the pseudo-type `internal`, and the argument of
+`count(expression)` is the pseudo-type `any`. `pg_type` has neither.
 A comparison (also of BETWEEN, an IN list, `IN (SELECT ...)`, `CASE x WHEN`,
 NULLIF and each pair of two row values), an arithmetic operator or a
 bit operator is refused with 42883 (`operator does not exist`) when no row of

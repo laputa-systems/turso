@@ -784,6 +784,119 @@ expect {
     6396|min|11|10|12|1|0|0|a|f|f|f|f|i|s|1|0|17|17
 }
 
+# pg_aggregate has the rows of PostgreSQL for the aggregates of pg_proc. It
+# leaves out the function columns and the sort operator, which tursopg cannot
+# name by the oids of PostgreSQL.
+test pg-aggregate-lists-the-aggregates-of-the-frontend {
+    SELECT p.proname, p.proargtypes::text, a.aggkind, a.aggnumdirectargs,
+           a.aggfinalextra, a.aggmfinalextra, a.aggfinalmodify, a.aggmfinalmodify,
+           a.aggtranstype, a.aggtransspace, a.aggmtranstype, a.aggmtransspace,
+           a.agginitval, a.aggminitval
+    FROM pg_aggregate a JOIN pg_proc p ON p.oid = a.aggfnoid
+    WHERE p.proname IN ('avg', 'count', 'max', 'min', 'stddev', 'string_agg', 'sum')
+      AND p.proargtypes::text IN ('', '17', '17 17', '20', '21', '23', '25', '25 25', '26',
+                                  '700', '701', '1082', '1114', '1184', '1700', '2276')
+    ORDER BY p.oid;
+}
+expect {
+    avg|20|n|0|f|f|r|r|2281|48|2281|48||
+    avg|23|n|0|f|f|r|r|1016|0|1016|0|{0,0}|{0,0}
+    avg|21|n|0|f|f|r|r|1016|0|1016|0|{0,0}|{0,0}
+    avg|1700|n|0|f|f|r|r|2281|128|2281|128||
+    avg|700|n|0|f|f|r|r|1022|0|0|0|{0,0,0}|
+    avg|701|n|0|f|f|r|r|1022|0|0|0|{0,0,0}|
+    sum|20|n|0|f|f|r|r|2281|48|2281|48||
+    sum|23|n|0|f|f|r|r|20|0|1016|0||{0,0}
+    sum|21|n|0|f|f|r|r|20|0|1016|0||{0,0}
+    sum|700|n|0|f|f|r|r|700|0|0|0||
+    sum|701|n|0|f|f|r|r|701|0|0|0||
+    sum|1700|n|0|f|f|r|r|2281|128|2281|128||
+    max|20|n|0|f|f|r|r|20|0|0|0||
+    max|23|n|0|f|f|r|r|23|0|0|0||
+    max|21|n|0|f|f|r|r|21|0|0|0||
+    max|26|n|0|f|f|r|r|26|0|0|0||
+    max|700|n|0|f|f|r|r|700|0|0|0||
+    max|701|n|0|f|f|r|r|701|0|0|0||
+    max|1082|n|0|f|f|r|r|1082|0|0|0||
+    max|1114|n|0|f|f|r|r|1114|0|0|0||
+    max|1184|n|0|f|f|r|r|1184|0|0|0||
+    max|25|n|0|f|f|r|r|25|0|0|0||
+    max|1700|n|0|f|f|r|r|1700|0|0|0||
+    min|20|n|0|f|f|r|r|20|0|0|0||
+    min|23|n|0|f|f|r|r|23|0|0|0||
+    min|21|n|0|f|f|r|r|21|0|0|0||
+    min|26|n|0|f|f|r|r|26|0|0|0||
+    min|700|n|0|f|f|r|r|700|0|0|0||
+    min|701|n|0|f|f|r|r|701|0|0|0||
+    min|1082|n|0|f|f|r|r|1082|0|0|0||
+    min|1114|n|0|f|f|r|r|1114|0|0|0||
+    min|1184|n|0|f|f|r|r|1184|0|0|0||
+    min|25|n|0|f|f|r|r|25|0|0|0||
+    min|1700|n|0|f|f|r|r|1700|0|0|0||
+    count|2276|n|0|f|f|r|r|20|0|20|0|0|0
+    stddev|20|n|0|f|f|r|r|2281|128|2281|128||
+    stddev|23|n|0|f|f|r|r|2281|48|2281|48||
+    stddev|21|n|0|f|f|r|r|2281|48|2281|48||
+    stddev|700|n|0|f|f|r|r|1022|0|0|0|{0,0,0}|
+    stddev|701|n|0|f|f|r|r|1022|0|0|0|{0,0,0}|
+    stddev|1700|n|0|f|f|r|r|2281|128|2281|128||
+    count||n|0|f|f|r|r|20|0|20|0|0|0
+    string_agg|25 25|n|0|f|f|r|r|2281|0|0|0||
+    string_agg|17 17|n|0|f|f|r|r|2281|0|0|0||
+    max|17|n|0|f|f|r|r|17|0|0|0||
+    min|17|n|0|f|f|r|r|17|0|0|0||
+}
+
+test pg-aggregate-rows-are-aggregates-of-pg-proc {
+    SELECT count(*) FROM pg_aggregate a LEFT JOIN pg_proc p ON p.oid = a.aggfnoid
+    WHERE p.oid IS NULL OR p.prokind <> 'a';
+}
+expect {
+    0
+}
+
+test pg-aggregate-sort-operators-are-rows-of-pg-operator {
+    SELECT p.proname, p.proargtypes::text, o.oprname, o.oprleft, o.oprright
+    FROM pg_aggregate a
+    JOIN pg_proc p ON p.oid = a.aggfnoid
+    JOIN pg_operator o ON o.oid = a.aggsortop
+    WHERE p.proname IN ('max', 'min')
+      AND p.proargtypes::text IN ('20', '21', '23', '25', '700', '701', '1082', '1114', '1184', '1700')
+    ORDER BY p.oid;
+}
+expect {
+    max|20|>|20|20
+    max|23|>|23|23
+    max|21|>|21|21
+    max|700|>|700|700
+    max|701|>|701|701
+    max|1082|>|1082|1082
+    max|1114|>|1114|1114
+    max|1184|>|1184|1184
+    max|25|>|25|25
+    max|1700|>|1700|1700
+    min|20|<|20|20
+    min|23|<|23|23
+    min|21|<|21|21
+    min|700|<|700|700
+    min|701|<|701|701
+    min|1082|<|1082|1082
+    min|1114|<|1114|1114
+    min|1184|<|1184|1184
+    min|25|<|25|25
+    min|1700|<|1700|1700
+}
+
+test pg-object-aggregate-is-read-only {
+    CREATE ROLE reader_of_object_aggregate_is_read_only_role;
+    SET ROLE reader_of_object_aggregate_is_read_only_role;
+    DELETE FROM pg_aggregate;
+}
+@sqlstate 42501
+expect error {permission denied for table pg_aggregate}
+@sqlstate 42501
+expect @tursopg error {cannot delete from pg_catalog table "pg_aggregate"}
+
 test pg-object-opclass-is-read-only {
     CREATE ROLE reader_of_object_opclass_is_read_only_role;
     SET ROLE reader_of_object_opclass_is_read_only_role;
