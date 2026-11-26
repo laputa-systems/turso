@@ -4,6 +4,9 @@
 //! relations.
 
 mod boolean;
+mod float;
+
+pub use float::{read_pg_float, FloatInputError};
 
 use crate::session::relation_lookup_namespaces;
 use std::sync::Arc;
@@ -14,7 +17,10 @@ use turso_core::{Connection, Result};
 /// `builder`. Each one replaces the type that core registered under the same
 /// name.
 pub(crate) fn register_builtin_types(builder: SchemaBuilder) -> Result<SchemaBuilder> {
-    builder.builtin_type(&boolean::Boolean)
+    builder
+        .builtin_type(&boolean::Boolean)?
+        .builtin_type(&float::Float4)?
+        .builtin_type(&float::Float8)
 }
 
 // FIXME(pg-catalog): three places that do not know about each other say what

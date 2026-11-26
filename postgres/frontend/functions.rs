@@ -1747,7 +1747,9 @@ impl JsonElement {
     fn of_type(name: &str) -> Self {
         match name {
             "boolean" => Self::Boolean,
-            "integer" | "smallint" | "bigint" | "real" | "numeric" => Self::Number,
+            "integer" | "smallint" | "bigint" | "real" | "float4" | "float8" | "numeric" => {
+                Self::Number
+            }
             "json" | "jsonb" => Self::Json,
             // A cast to bytea is a cast to blob, so a blob is a bytea.
             "bytea" | "blob" => Self::Bytea,
@@ -1830,20 +1832,133 @@ fn write_json_string(text: &str, json: &mut String) {
 /// A float8 in PostgreSQL's text form: the shortest digits that read back as
 /// the same number, in scientific notation when the exponent is below -4 or
 /// 15 or more, as in `1e+20` and `1e-05`.
-fn float8_text(value: f64) -> String {
-    if value.is_infinite() {
-        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+pub(crate) fn float8_text(value: f64) -> String {
+    if let Some(text) = float_special_text(value) {
+        return text;
     }
-    let scientific = format!("{value:e}");
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("scientific notation has an exponent");
-    let exponent: i32 = exponent.parse().expect("the exponent is a number");
-    if (-4..15).contains(&exponent) {
-        format!("{value}")
+    float_text(&shortest_f64(value), -4..15)
+}
+
+/// A float4 in PostgreSQL's text form, like [float8_text] for the digits of a
+/// float4, in scientific notation when the exponent is below -4 or 6 or more,
+/// as in `1e+06`.
+pub(crate) fn float4_text(value: f32) -> String {
+    if let Some(text) = float_special_text(f64::from(value)) {
+        return text;
+    }
+    float_text(&shortest_f32(value), -4..6)
+}
+
+fn float_special_text(value: f64) -> Option<String> {
+    if value.is_nan() {
+        return Some("NaN".to_string());
+    }
+    if value.is_infinite() {
+        return Some(if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string());
+    }
+    None
+}
+
+/// The shortest text that reads back as `value`, as PostgreSQL's float output
+/// writes it. PostgreSQL uses the Ryu algorithm and does not accept a text
+/// that is exactly halfway to the next float, which the algorithm of the `ryu`
+/// crate accepts when the float's last bit is zero. So 1e23, which is such a
+/// text, is written as 9.999999999999999e+22. When the shortest text is
+/// halfway, the next one that is not is used.
+macro_rules! shortest_text {
+    ($name:ident, $float:ty) => {
+        fn $name(value: $float) -> String {
+            let ryu_text = ryu::Buffer::new().format_finite(value).to_string();
+            let (sign, digits, exponent) = decimal_digits(&ryu_text);
+            if digits == "0" || !is_halfway::<$float>(&digits, exponent, value.abs()) {
+                return ryu_text;
+            }
+            for count in digits.len() + 1..=17 {
+                let text = format!("{:.*e}", count - 1, value.abs());
+                let (_, longer, longer_exponent) = decimal_digits(&text);
+                if text.parse::<$float>() == Ok(value.abs())
+                    && !is_halfway::<$float>(&longer, longer_exponent, value.abs())
+                {
+                    return format!("{sign}{text}");
+                }
+            }
+            ryu_text
+        }
+    };
+}
+
+shortest_text!(shortest_f64, f64);
+shortest_text!(shortest_f32, f32);
+
+/// Whether the number `digits` (with its first digit at the power of ten
+/// `exponent`) only reads back as `value` because a number halfway between two
+/// floats goes to the one with an even last bit: a little more or a little
+/// less than it reads as another float.
+fn is_halfway<F: std::str::FromStr + PartialEq + Copy>(
+    digits: &str,
+    exponent: i32,
+    value: F,
+) -> bool {
+    let Ok(number) = digits.parse::<u128>() else {
+        return false;
+    };
+    let scale = exponent - (digits.len() as i32 - 1) - 20;
+    let above = format!("{number}{}1e{scale}", "0".repeat(19));
+    let below = format!("{}{}e{scale}", number - 1, "9".repeat(20));
+    above.parse::<F>().ok() != Some(value) || below.parse::<F>().ok() != Some(value)
+}
+
+/// The sign, the digits without leading and trailing zeros, and the power of
+/// ten of the first digit, of a number written by `ryu` or by `{:e}`.
+fn decimal_digits(text: &str) -> (&'static str, String, i32) {
+    let (sign, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text),
+    };
+    let (mantissa, exponent) = match unsigned.split_once('e') {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().expect("a number")),
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all_digits = format!("{whole}{fraction}");
+    let leading_zeros = all_digits.len() - all_digits.trim_start_matches('0').len();
+    let digits = all_digits.trim_start_matches('0').trim_end_matches('0');
+    if digits.is_empty() {
+        return (sign, "0".to_string(), 0);
+    }
+    let exponent = whole.len() as i32 - 1 - leading_zeros as i32 + exponent;
+    (sign, digits.to_string(), exponent)
+}
+
+/// Writes the number in `text` in decimal notation when its exponent is in
+/// `plain_exponents` and in scientific notation otherwise.
+fn float_text(text: &str, plain_exponents: std::ops::Range<i32>) -> String {
+    let (sign, digits, exponent) = decimal_digits(text);
+    if digits == "0" {
+        return format!("{sign}0");
+    }
+    if plain_exponents.contains(&exponent) {
+        let point = exponent + 1;
+        if point <= 0 {
+            format!("{sign}0.{}{digits}", "0".repeat(-point as usize))
+        } else if digits.len() as i32 <= point {
+            format!(
+                "{sign}{digits}{}",
+                "0".repeat(point as usize - digits.len())
+            )
+        } else {
+            let (whole, fraction) = digits.split_at(point as usize);
+            format!("{sign}{whole}.{fraction}")
+        }
     } else {
-        let sign = if exponent < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exponent.abs())
+        let exponent_sign = if exponent < 0 { '-' } else { '+' };
+        let (first, rest) = digits.split_at(1);
+        let mantissa = if rest.is_empty() {
+            first.to_string()
+        } else {
+            format!("{first}.{rest}")
+        };
+        format!("{sign}{mantissa}e{exponent_sign}{:02}", exponent.abs())
     }
 }
 
@@ -2399,28 +2514,12 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 }
             }
         },
-        "float4" | "real" => match trimmed.parse::<f32>() {
-            Ok(v) if v.is_infinite() => Some((
-                format!("value \"{input}\" is out of range for type real"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type real: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "float8" | "double precision" => match trimmed.parse::<f64>() {
-            Ok(v) if v.is_infinite() => Some((
-                format!("value \"{input}\" is out of range for type double precision"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type double precision: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
+        "float4" | "real" | "float8" | "double precision" => {
+            let single = matches!(base_type.as_str(), "float4" | "real");
+            crate::pg_type::read_pg_float(input, single)
+                .err()
+                .map(|error| (error.message, error.sqlstate.to_string()))
+        }
         "numeric" | "decimal" => match trimmed.parse::<f64>() {
             Ok(v) if v.is_nan() || v.is_infinite() => Some((
                 format!("invalid input syntax for type numeric: \"{input}\""),
@@ -2817,8 +2916,33 @@ mod tests {
             (1e20, "1e+20"),
             (-1.25e300, "-1.25e+300"),
             (f64::MAX, "1.7976931348623157e+308"),
+            (900719925474099.2, "900719925474099.2"),
+            (36028797002186752.0, "3.6028797002186752e+16"),
+            (1e22, "1e+22"),
+            (1e23, "9.999999999999999e+22"),
+            (2e23, "1.9999999999999998e+23"),
+            (8.41e21, "8.409999999999999e+21"),
+            (5e-324, "5e-324"),
         ] {
             assert_eq!(float8_text(value), text, "{value:e}");
+        }
+    }
+
+    #[test]
+    fn float4_text_is_postgres_float4_output() {
+        for (value, text) in [
+            (0.1, "0.1"),
+            (-0.0, "-0"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (999999.0, "999999"),
+            (1000000.0, "1e+06"),
+            (1234567.0, "1.234567e+06"),
+            (16777216.0, "1.6777216e+07"),
+            (3.4028235e38, "3.4028235e+38"),
+            (1e-45, "1e-45"),
+        ] {
+            assert_eq!(float4_text(value), text, "{value:e}");
         }
     }
 }
