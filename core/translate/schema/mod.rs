@@ -1390,35 +1390,11 @@ pub fn translate_create_table(
     });
     program.preassign_label_to_next_insn(create_btree_label);
 
-    let created_sequence_table = if has_autoincrement
+    let created_sequence_table = has_autoincrement
         && resolver.with_schema(database_id, |s| {
             s.get_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
                 .is_none()
-        }) {
-        let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
-        let seq_table_root_reg = program.alloc_register();
-        program.emit_insn(Insn::CreateBtree {
-            db: database_id,
-            root: seq_table_root_reg,
-            flags: CreateBTreeFlags::new_table(),
         });
-
-        let seq_sql = "CREATE TABLE sqlite_sequence(name,seq)";
-        emit_schema_entry(
-            program,
-            resolver,
-            sqlite_schema_cursor_id,
-            cdc_table.as_ref().map(|x| x.0),
-            SchemaEntryType::Table,
-            SQLITE_SEQUENCE_TABLE_NAME,
-            SQLITE_SEQUENCE_TABLE_NAME,
-            seq_table_root_reg,
-            Some(seq_sql.to_string()),
-        )?;
-        true
-    } else {
-        false
-    };
 
     let parse_schema_label = program.allocate_label();
 
@@ -1542,12 +1518,33 @@ pub fn translate_create_table(
         }),
     )?;
 
+    if created_sequence_table {
+        let sqlite_schema_cursor_id = open_sqlite_schema_for_write(program, resolver, database_id);
+        let seq_table_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: seq_table_root_reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            cdc_table.as_ref().map(|x| x.0),
+            SchemaEntryType::Table,
+            SQLITE_SEQUENCE_TABLE_NAME,
+            SQLITE_SEQUENCE_TABLE_NAME,
+            seq_table_root_reg,
+            Some("CREATE TABLE sqlite_sequence(name,seq)".to_string()),
+        )?;
+    }
+
     // Create the backing table for the hidden AUTOINCREMENT sequence. The
     // `__turso_internal_autoincrement_` prefix identifies the sequence object;
     // `sequence_backing_table_name` then maps it to the physical
     // `__turso_internal_seq_<sequence-name>` table.
     // Skip if it already exists (e.g. VACUUM INTO copies all tables first).
-    if has_autoincrement {
+    if has_autoincrement && connection.mvcc_enabled() {
         let autoinc_seq_name = crate::schema::autoincrement_sequence_name(&mangled_tbl_name);
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&autoinc_seq_name);
