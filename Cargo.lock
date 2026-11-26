@@ -7258,6 +7258,7 @@ dependencies = [
  "either",
  "env_logger",
  "fallible-iterator 0.3.0",
+ "fancy-regex",
  "fastbloom",
  "getrandom 0.2.15",
  "getrandom 0.3.2",

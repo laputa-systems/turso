@@ -67,6 +67,11 @@ This project depends on tantivy-common, distributed by the Tantivy project autho
 * License: licenses/core/tantivy-common-mit-license.md (MIT License)
 * Homepage: https://github.com/quickwit-oss/tantivy
 
+This project depends on fancy-regex, distributed by the Fancy Regex Authors:
+
+* License: licenses/core/fancy-regex-mit-license.md (MIT License)
+* Homepage: https://github.com/fancy-regex/fancy-regex
+
 This project depends on ICU4X (icu_casemap, icu_collator, icu_locale and icu_properties), distributed by the Unicode Consortium, and its Greek letter data is copied into core/functions/icu.rs:
 
 * License: licenses/core/icu4x-unicode-license.md (Unicode License V3)

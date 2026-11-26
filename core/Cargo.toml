@@ -107,6 +107,7 @@ icu_casemap = "~2.2.0"
 icu_collator = "2.2.0"
 icu_locale = "2.2.0"
 icu_properties = "2.2.0"
+fancy-regex = "0.16.2"
 thiserror = { workspace = true }
 regex = { workspace = true }
 regex-syntax = { workspace = true, default-features = false, features = [

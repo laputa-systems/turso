@@ -12,6 +12,7 @@
 //! it.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -21,9 +22,6 @@ use icu_locale::langid;
 use icu_locale::LanguageIdentifier;
 use icu_properties::props::{CaseIgnorable, Cased};
 use icu_properties::{CodePointSetData, CodePointSetDataBorrowed};
-use regex_syntax::hir::{
-    Capture, Class, ClassUnicode, ClassUnicodeRange, Dot, Hir, HirKind, Repetition,
-};
 
 use crate::ast::{self, Cmd, CreateTableBody, Privilege, QualifiedName, Stmt};
 use crate::dialect::{
@@ -37,6 +35,8 @@ use crate::security::policy::RowPolicy;
 use crate::security::roles::RoleId;
 use crate::vdbe::Register;
 use crate::{Connection, LikeFunction, LimboError, OpenOptions, Result, Value};
+
+use super::icu_regex;
 
 /// The longest LIKE pattern, in bytes, that the extension accepts. It is
 /// the extension's own default of SQLITE_MAX_LIKE_PATTERN_LENGTH.
@@ -920,46 +920,22 @@ fn regexp(pattern: &Value, string: &Value) -> Result<Value> {
     let until_nul = |text: &[u8]| text.iter().position(|&b| b == 0).unwrap_or(text.len());
     let pattern = sqlite_utf16_text(&pattern[..until_nul(&pattern)]);
     let string = sqlite_utf16_text(&string[..until_nul(&string)]);
-    let syntax_error =
-        || LimboError::SqlError("ICU error: uregex_open(): U_REGEX_RULE_SYNTAX".to_string());
-    let hir = regex_syntax::Parser::new()
-        .parse(&pattern)
-        .map_err(|_| syntax_error())?;
-    let hir = with_icu_dot(hir);
-    let regex = regex::Regex::new(&format!(r"\A(?:{hir})\z")).map_err(|_| syntax_error())?;
-    Ok(Value::from_i64(i64::from(regex.is_match(&string))))
-}
-
-/// `hir` with each `.` matching what it matches in ICU: any character but a
-/// line terminator, which is `\n`, `\r`, U+0085, U+2028 or U+2029.
-fn with_icu_dot(hir: Hir) -> Hir {
-    let rust_dot = Hir::dot(Dot::AnyCharExceptLF);
-    let rebuild = |hirs: Vec<Hir>| hirs.into_iter().map(with_icu_dot).collect::<Vec<_>>();
-    match hir.into_kind() {
-        HirKind::Class(class) if Hir::class(class.clone()) == rust_dot => {
-            Hir::class(Class::Unicode(ClassUnicode::new([
-                ClassUnicodeRange::new('\0', '\u{9}'),
-                ClassUnicodeRange::new('\u{b}', '\u{c}'),
-                ClassUnicodeRange::new('\u{e}', '\u{84}'),
-                ClassUnicodeRange::new('\u{86}', '\u{2027}'),
-                ClassUnicodeRange::new('\u{202a}', '\u{10ffff}'),
-            ])))
-        }
-        HirKind::Class(class) => Hir::class(class),
-        HirKind::Repetition(repetition) => Hir::repetition(Repetition {
-            sub: Box::new(with_icu_dot(*repetition.sub)),
-            ..repetition
-        }),
-        HirKind::Capture(capture) => Hir::capture(Capture {
-            sub: Box::new(with_icu_dot(*capture.sub)),
-            ..capture
-        }),
-        HirKind::Concat(hirs) => Hir::concat(rebuild(hirs)),
-        HirKind::Alternation(hirs) => Hir::alternation(rebuild(hirs)),
-        HirKind::Empty => Hir::empty(),
-        HirKind::Literal(literal) => Hir::literal(literal.0),
-        HirKind::Look(look) => Hir::look(look),
+    thread_local! {
+        static LAST_PATTERN: RefCell<Option<(String, fancy_regex::Regex)>> = const { RefCell::new(None) };
     }
+    LAST_PATTERN.with_borrow_mut(|last| {
+        if last.as_ref().is_none_or(|(text, _)| *text != *pattern) {
+            let regex = icu_regex::compile(&pattern).ok_or_else(|| {
+                LimboError::SqlError("ICU error: uregex_open(): U_REGEX_RULE_SYNTAX".to_string())
+            })?;
+            *last = Some((pattern.to_string(), regex));
+        }
+        let (_, regex) = last.as_ref().expect("the pattern was compiled");
+        let matched = regex.is_match(&string).map_err(|_| {
+            LimboError::SqlError("ICU error: uregex_matches(): U_REGEX_STACK_OVERFLOW".to_string())
+        })?;
+        Ok(Value::from_i64(i64::from(matched)))
+    })
 }
 
 #[cfg(test)]
