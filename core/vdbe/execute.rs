@@ -11443,6 +11443,29 @@ pub fn op_function(
 
                     (new_name, new_tbl_name, new_sql)
                 }
+                AlterTableFunc::AddColumnText => {
+                    let Value::Text(table) = &state.registers[*start_reg + 5].get_value() else {
+                        panic!("the altered table name should be TEXT")
+                    };
+                    let Value::Text(column) = &state.registers[*start_reg + 6].get_value() else {
+                        panic!("the added column text should be TEXT")
+                    };
+                    let new_sql = match sql {
+                        Value::Text(sql) if entry_type.as_str() == "table" && name == table.as_str() => Some(
+                            connection
+                                .dialect()
+                                .table_sql_with_added_column(sql.as_str(), column.as_str())
+                                .ok_or_else(|| {
+                                    LimboError::InternalError(format!(
+                                        "cannot add a column to the stored text of {name}"
+                                    ))
+                                })?,
+                        ),
+                        Value::Text(sql) => Some(sql.as_str().to_string()),
+                        _ => None,
+                    };
+                    (name, tbl_name, new_sql)
+                }
                 AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
                     let table = {
                         match &state.registers[*start_reg + 5].get_value() {

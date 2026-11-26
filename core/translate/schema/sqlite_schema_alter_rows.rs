@@ -188,6 +188,20 @@ pub(super) fn emit_add_column_rows(
     ctx: &CmdContext<'_>,
     column: &AddColumn<'_>,
 ) -> Result<()> {
+    if let Some(text) = ctx.resolver.catalog.dialect.added_column_text(column.statement) {
+        let namespace = NamespaceRef {
+            database_id: ctx.database_id,
+            id: column.namespace,
+        };
+        emit_rewrite_of_every_row(
+            program,
+            ctx,
+            AlterTableFunc::AddColumnText,
+            &[ctx.resolver.mangle_name(namespace, column.name), text],
+            column.name,
+        );
+        return Ok(());
+    }
     emit_update_of_table_sql(
         program,
         ctx,

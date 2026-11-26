@@ -245,6 +245,18 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(canonical)
     }
 
+    /// The column definition of an `ALTER TABLE ... ADD COLUMN` statement as
+    /// written, when the dialect stores written text and can find it.
+    fn added_column_text(&self, _input: &str) -> Option<String> {
+        None
+    }
+
+    /// The stored `CREATE TABLE` text `sql` with the written column
+    /// definition `column` added, as the dialect would store it.
+    fn table_sql_with_added_column(&self, _sql: &str, _column: &str) -> Option<String> {
+        None
+    }
+
     /// Produce the SQL text to store in `sqlite_schema` for a
     /// `CREATE TRIGGER`, given the statement as written and the canonical
     /// text rendered from its AST. The default stores the canonical text.

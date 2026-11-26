@@ -69,4 +69,12 @@ impl Dialect for SqliteDialect {
     fn format_trigger_sql(&self, input: &str, canonical: String) -> Result<String> {
         Ok(schema_text::trigger_text(input).unwrap_or(canonical))
     }
+
+    fn added_column_text(&self, input: &str) -> Option<String> {
+        schema_text::added_column_text(input)
+    }
+
+    fn table_sql_with_added_column(&self, sql: &str, column: &str) -> Option<String> {
+        schema_text::table_sql_with_added_column(sql, column)
+    }
 }

@@ -116,6 +116,70 @@ pub fn trigger_text(sql: &str) -> Option<String> {
     Some(format!("CREATE TRIGGER {}", &sql[tokens[name].start..end.end]))
 }
 
+pub fn added_column_text(sql: &str) -> Option<String> {
+    let tokens = tokens(sql)?;
+    let mut index = 0;
+    if tokens.get(index)?.kind != TokenType::TK_ALTER || tokens.get(index + 1)?.kind != TokenType::TK_TABLE {
+        return None;
+    }
+    index += 2;
+    if !is_name(tokens.get(index)?.kind) {
+        return None;
+    }
+    if tokens.get(index + 1).is_some_and(|token| token.kind == TokenType::TK_DOT) {
+        index += 2;
+    }
+    index += 1;
+    if tokens.get(index)?.kind != TokenType::TK_ADD {
+        return None;
+    }
+    index += 1;
+    if tokens.get(index)?.kind == TokenType::TK_COLUMNKW {
+        index += 1;
+    }
+    let start = tokens.get(index)?.start;
+    Some(sql[start..].trim_end_matches(|c: char| c == ';' || c.is_ascii_whitespace() || c == '\x0b' || c == '\x0c').to_string())
+}
+
+pub fn table_sql_with_added_column(sql: &str, column: &str) -> Option<String> {
+    let tokens = tokens(sql)?;
+    let name = name_index(&tokens, TokenType::TK_TABLE)?;
+    let open = tokens[name..].iter().position(|token| token.kind == TokenType::TK_LP)? + name;
+    let mut depth = 0usize;
+    let mut offset = None;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        match token.kind {
+            TokenType::TK_LP => depth += 1,
+            TokenType::TK_RP => {
+                depth -= 1;
+                if depth == 0 {
+                    offset = Some(token.start);
+                    break;
+                }
+            }
+            TokenType::TK_COMMA
+                if depth == 1
+                    && tokens.get(index + 1).is_some_and(|next| {
+                        matches!(
+                            next.kind,
+                            TokenType::TK_CONSTRAINT
+                                | TokenType::TK_PRIMARY
+                                | TokenType::TK_UNIQUE
+                                | TokenType::TK_CHECK
+                                | TokenType::TK_FOREIGN
+                        )
+                    }) =>
+            {
+                offset = Some(token.start);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let offset = offset?;
+    Some(format!("{}, {}{}", &sql[..offset], column, &sql[offset..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +190,16 @@ mod tests {
         assert_eq!(table_text("CREATE TABLE \"x y\" (a)").as_deref(), Some("CREATE TABLE \"x y\" (a)"));
         assert_eq!(table_text("CREATE TABLE s(k PRIMARY KEY) WITHOUT ROWID ;").as_deref(), Some("CREATE TABLE s(k PRIMARY KEY) WITHOUT ROWID "));
         assert_eq!(table_text("CREATE TEMP TABLE t(a) STRICT").as_deref(), Some("CREATE TABLE t(a) STRICT"));
+    }
+
+    #[test]
+    fn added_columns_go_before_table_constraints() {
+        assert_eq!(added_column_text("ALTER TABLE t ADD COLUMN e TEXT DEFAULT 'x' ;").as_deref(), Some("e TEXT DEFAULT 'x'"));
+        assert_eq!(table_sql_with_added_column("CREATE TABLE t(a, b)", "c").as_deref(), Some("CREATE TABLE t(a, b, c)"));
+        assert_eq!(
+            table_sql_with_added_column("CREATE TABLE t(a INT, b CHECK(b > (1)), PRIMARY KEY(a))", "c").as_deref(),
+            Some("CREATE TABLE t(a INT, b CHECK(b > (1)), c, PRIMARY KEY(a))")
+        );
     }
 
     #[test]
