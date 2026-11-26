@@ -155,21 +155,6 @@ pub fn translate_create_index(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    if schema::relation_name_is_taken(resolver, namespace, &idx_name, if_not_exists)? {
-        return Ok(());
-    }
-    // Check if the index is being created on a valid btree table and
-    // the name is globally unique in the schema.
-    let schema_unique = resolver.with_schema(database_id, |s| {
-        s.is_unique_idx_name(namespace.id, &idx_name)
-    });
-    if !schema_unique {
-        // If IF NOT EXISTS is specified, silently return without error
-        if if_not_exists {
-            return Ok(());
-        }
-        crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
-    }
     // Materialized views store their rows in a real table btree (so plain
     // reads can use get_table() below like any other table), but writes to
     // that btree go through the DBSP maintenance path (sink.rs), which emits
@@ -196,6 +181,21 @@ pub fn translate_create_index(
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("virtual tables may not be indexed");
     };
+    if schema::relation_name_is_taken(resolver, namespace, &idx_name, if_not_exists)? {
+        return Ok(());
+    }
+    // Check if the index is being created on a valid btree table and
+    // the name is globally unique in the schema.
+    let schema_unique = resolver.with_schema(database_id, |s| {
+        s.is_unique_idx_name(namespace.id, &idx_name)
+    });
+    if !schema_unique {
+        // If IF NOT EXISTS is specified, silently return without error
+        if if_not_exists {
+            return Ok(());
+        }
+        crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
+    }
     // Not checked when the schema loads or when a nested statement such as VACUUM
     // replays the stored schema, so databases that already have such an index keep
     // working.
