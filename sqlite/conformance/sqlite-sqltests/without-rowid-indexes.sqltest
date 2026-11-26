@@ -321,3 +321,43 @@ expect {
     1|0|a|0|NOCASE|0
     ok
 }
+
+@cross-check-integrity
+test without-rowid-primary-key-collation-keeps-unique-index {
+    CREATE TABLE t(a TEXT, b, PRIMARY KEY(a COLLATE NOCASE), UNIQUE(a)) WITHOUT ROWID;
+    SELECT name FROM sqlite_schema;
+    INSERT INTO t VALUES ('x', 1);
+    INSERT INTO t VALUES ('X', 2);
+}
+expect error {
+    UNIQUE constraint failed: t.a
+}
+
+@cross-check-integrity
+test without-rowid-integer-primary-key-takes-unique-index-order {
+    CREATE TABLE t(a INTEGER, b, PRIMARY KEY(a COLLATE NOCASE DESC), UNIQUE(a)) WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 'p'), (3, 'q'), (2, 'r');
+    SELECT * FROM t;
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    1|p
+    2|r
+    3|q
+    t
+}
+
+@cross-check-integrity
+test without-rowid-update-or-ignore-visits-rows-by-primary-key {
+    CREATE TABLE t(a NUMERIC, b, PRIMARY KEY(a DESC), UNIQUE(b)) WITHOUT ROWID;
+    CREATE UNIQUE INDEX ta ON t(a);
+    INSERT INTO t VALUES (1, 'p'), (2, 'q'), (3, 'r'), (4, 's');
+    UPDATE OR IGNORE t SET b = 'z' WHERE a > 1;
+    SELECT * FROM t;
+}
+expect {
+    4|z
+    3|r
+    2|q
+    1|p
+}
