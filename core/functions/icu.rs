@@ -19,6 +19,8 @@ use icu_casemap::CaseMapper;
 use icu_casemap::CaseMapperBorrowed;
 use icu_locale::langid;
 use icu_locale::LanguageIdentifier;
+use icu_properties::props::{CaseIgnorable, Cased};
+use icu_properties::{CodePointSetData, CodePointSetDataBorrowed};
 use regex_syntax::hir::{
     Capture, Class, ClassUnicode, ClassUnicodeRange, Dot, Hir, HirKind, Repetition,
 };
@@ -481,21 +483,239 @@ fn case_map<'a>(mut args: impl Iterator<Item = &'a Value>, case: Case) -> Value 
     let text = sqlite_utf16_text(&input);
     let language = case_language(locale.as_deref());
     let mapped = match case {
-        Case::Upper => CASE_MAPPER.uppercase_to_string(&text, language),
-        Case::Lower => CASE_MAPPER.lowercase_to_string(&text, language),
+        Case::Upper if *language == GREEK => greek_uppercase(&text),
+        Case::Upper => CASE_MAPPER.uppercase_to_string(&text, language).into_owned(),
+        Case::Lower => CASE_MAPPER.lowercase_to_string(&text, language).into_owned(),
     };
-    Value::build_text(mapped.into_owned())
+    Value::build_text(mapped)
 }
+
+static GREEK: LanguageIdentifier = langid!("el");
+
+/// Greek uppercasing, ICU 78's `GreekUpper::toUpper`: each Greek letter
+/// loses its accents and breathings, keeps or gains a dialytika, and maps a
+/// iota subscript to a capital iota; other characters map as in the root
+/// locale.
+fn greek_uppercase(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut upper = String::with_capacity(text.len());
+    let mut other_start = 0;
+    let mut state = GreekState::default();
+    let mut index = 0;
+    while index < chars.len() {
+        let c = chars[index];
+        let mut next = index + 1;
+        let mut next_state = GreekState {
+            after_cased: if CASE_IGNORABLE.contains(c) {
+                state.after_cased
+            } else {
+                CASED.contains(c)
+            },
+            after_accented_vowel: None,
+        };
+        let Some(letter) = greek_letter(c) else {
+            index = next;
+            state = next_state;
+            continue;
+        };
+        let other: String = chars[other_start..index].iter().collect();
+        upper.push_str(&CASE_MAPPER.uppercase_to_string(&other, &ROOT));
+        let mut marks = letter.marks;
+        let mut base = letter.base;
+        if letter.vowel && matches!(base, 'Ι' | 'Υ') {
+            match state.after_accented_vowel {
+                Some(GreekAccent::Precomposed) => marks.dialytika = true,
+                Some(GreekAccent::Combining) => marks.combining_dialytika = true,
+                None => {}
+            }
+        }
+        let mut iota_subscripts = usize::from(marks.ypogegrammeni);
+        let precomposed_accent = marks.accent;
+        while let Some(&mark) = chars.get(next) {
+            if !marks.add_combining(mark) {
+                break;
+            }
+            if mark == '\u{345}' {
+                iota_subscripts += 1;
+            }
+            next += 1;
+        }
+        if letter.vowel && marks.accent && !marks.dialytika {
+            next_state.after_accented_vowel = Some(if precomposed_accent {
+                GreekAccent::Precomposed
+            } else {
+                GreekAccent::Combining
+            });
+        }
+        let mut add_tonos = false;
+        if base == 'Η'
+            && marks.accent
+            && iota_subscripts == 0
+            && !state.after_cased
+            && !followed_by_cased_letter(&chars[next..])
+        {
+            // A lone accented eta keeps its tonos: it is the disjunctive "or".
+            if precomposed_accent {
+                base = 'Ή';
+            } else {
+                add_tonos = true;
+            }
+        } else if marks.dialytika && matches!(base, 'Ι' | 'Υ') {
+            base = if base == 'Ι' { 'Ϊ' } else { 'Ϋ' };
+            marks.dialytika = false;
+            marks.combining_dialytika = false;
+        }
+        upper.push(base);
+        if marks.dialytika || marks.combining_dialytika {
+            upper.push('\u{308}');
+        }
+        if add_tonos {
+            upper.push('\u{301}');
+        }
+        upper.extend(std::iter::repeat_n('Ι', iota_subscripts));
+        other_start = next;
+        index = next;
+        state = next_state;
+    }
+    let other: String = chars[other_start..].iter().collect();
+    upper.push_str(&CASE_MAPPER.uppercase_to_string(&other, &ROOT));
+    upper
+}
+
+static ROOT: LanguageIdentifier = LanguageIdentifier::UNKNOWN;
+const CASED: CodePointSetDataBorrowed<'static> = CodePointSetData::new::<Cased>();
+const CASE_IGNORABLE: CodePointSetDataBorrowed<'static> = CodePointSetData::new::<CaseIgnorable>();
+
+#[derive(Clone, Copy, Default)]
+struct GreekState {
+    after_cased: bool,
+    after_accented_vowel: Option<GreekAccent>,
+}
+
+/// Where a vowel has the accent that it loses, which decides how the iota
+/// or upsilon after it gains a dialytika.
+#[derive(Clone, Copy)]
+enum GreekAccent {
+    Precomposed,
+    Combining,
+}
+
+struct GreekLetter {
+    base: char,
+    vowel: bool,
+    marks: GreekMarks,
+}
+
+#[derive(Clone, Copy, Default)]
+struct GreekMarks {
+    accent: bool,
+    dialytika: bool,
+    combining_dialytika: bool,
+    ypogegrammeni: bool,
+}
+
+impl GreekMarks {
+    /// Adds a Greek combining diacritic, or says that `mark` is not one.
+    fn add_combining(&mut self, mark: char) -> bool {
+        match mark {
+            '\u{300}' | '\u{301}' | '\u{342}' | '\u{302}' | '\u{303}' | '\u{311}' => {
+                self.accent = true
+            }
+            '\u{308}' => self.combining_dialytika = true,
+            '\u{344}' => {
+                self.combining_dialytika = true;
+                self.accent = true;
+            }
+            '\u{345}' => self.ypogegrammeni = true,
+            '\u{304}' | '\u{306}' | '\u{313}' | '\u{314}' | '\u{343}' => {}
+            _ => return false,
+        }
+        true
+    }
+}
+
+fn followed_by_cased_letter(chars: &[char]) -> bool {
+    chars
+        .iter()
+        .find(|&&c| !CASE_IGNORABLE.contains(c))
+        .is_some_and(|&c| CASED.contains(c))
+}
+
+/// The Greek letter `c`: its capital base letter and the diacritics it
+/// carries, or None for a character that Greek uppercasing leaves to the
+/// root locale.
+fn greek_letter(c: char) -> Option<GreekLetter> {
+    let code = c as usize;
+    let packed = match code {
+        0x370..=0x3FF => GREEK_LETTERS_0370[code - 0x370],
+        0x1F00..=0x1FFC => GREEK_LETTERS_1F00[code - 0x1F00],
+        0x2126 => 7,
+        _ => 0,
+    };
+    if packed == 0 {
+        return None;
+    }
+    if packed & 0x80 != 0 {
+        let base = if packed & 1 != 0 { 'Ρ' } else { CASE_MAPPER.simple_uppercase(c) };
+        return Some(GreekLetter { base, vowel: false, marks: GreekMarks::default() });
+    }
+    let base = ['Α', 'Ε', 'Η', 'Ι', 'Ο', 'Υ', 'Ω', 'ϒ'][usize::from(packed & 0xF) - 1];
+    Some(GreekLetter {
+        base,
+        // ICU does not count the upsilon with hook as a vowel.
+        vowel: base != 'ϒ',
+        marks: GreekMarks {
+            accent: packed & 0x40 != 0,
+            dialytika: packed & 0x20 != 0,
+            combining_dialytika: false,
+            ypogegrammeni: packed & 0x10 != 0,
+        },
+    })
+}
+
+// The two tables are the Greek letter data of ICU4X (icu_casemap
+// greek_to_me/data.rs), Copyright © 2020-2024 Unicode, Inc., under the
+// Unicode License V3 in licenses/core/icu4x-unicode-license.md. A byte is 0
+// for no Greek letter; with bit 7 a consonant, which bit 0 marks as rho;
+// otherwise a vowel, whose low four bits are its capital (1 Α to 8 ϒ) and
+// whose bits 6, 5 and 4 mark an accent, a dialytika and a ypogegrammeni.
+const GREEK_LETTERS_0370: [u8; 0x90] = [
+    128, 128, 128, 128, 0, 0, 128, 128, 0, 0, 128, 128, 128, 128, 0, 128,
+    0, 0, 0, 0, 0, 0, 65, 0, 66, 67, 68, 0, 69, 0, 70, 71,
+    100, 1, 128, 128, 128, 2, 128, 3, 128, 4, 128, 128, 128, 128, 128, 5,
+    128, 129, 0, 128, 128, 6, 128, 128, 128, 7, 36, 38, 65, 66, 67, 68,
+    102, 1, 128, 128, 128, 2, 128, 3, 128, 4, 128, 128, 128, 128, 128, 5,
+    128, 129, 128, 128, 128, 6, 128, 128, 128, 7, 36, 38, 69, 70, 71, 128,
+    128, 128, 8, 72, 40, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+    128, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    128, 129, 128, 128, 128, 2, 0, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+];
+const GREEK_LETTERS_1F00: [u8; 0xFD] = [
+    1, 1, 65, 65, 65, 65, 65, 65, 1, 1, 65, 65, 65, 65, 65, 65,
+    2, 2, 66, 66, 66, 66, 0, 0, 2, 2, 66, 66, 66, 66, 0, 0,
+    3, 3, 67, 67, 67, 67, 67, 67, 3, 3, 67, 67, 67, 67, 67, 67,
+    4, 4, 68, 68, 68, 68, 68, 68, 4, 4, 68, 68, 68, 68, 68, 68,
+    5, 5, 69, 69, 69, 69, 0, 0, 5, 5, 69, 69, 69, 69, 0, 0,
+    6, 6, 70, 70, 70, 70, 70, 70, 0, 6, 0, 70, 0, 70, 0, 70,
+    7, 7, 71, 71, 71, 71, 71, 71, 7, 7, 71, 71, 71, 71, 71, 71,
+    65, 65, 66, 66, 67, 67, 68, 68, 69, 69, 70, 70, 71, 71, 0, 0,
+    17, 17, 81, 81, 81, 81, 81, 81, 17, 17, 81, 81, 81, 81, 81, 81,
+    19, 19, 83, 83, 83, 83, 83, 83, 19, 19, 83, 83, 83, 83, 83, 83,
+    23, 23, 87, 87, 87, 87, 87, 87, 23, 23, 87, 87, 87, 87, 87, 87,
+    1, 1, 81, 17, 81, 0, 65, 81, 1, 1, 65, 65, 17, 0, 4, 0,
+    0, 0, 83, 19, 83, 0, 67, 83, 66, 66, 67, 67, 19, 0, 0, 0,
+    4, 4, 100, 100, 0, 0, 68, 100, 4, 4, 68, 68, 0, 0, 0, 0,
+    6, 6, 102, 102, 129, 129, 70, 102, 6, 6, 70, 70, 129, 0, 0, 0,
+    0, 0, 87, 23, 87, 0, 71, 87, 69, 69, 71, 71, 23,
+];
 
 /// The language whose case mappings ICU uses for a locale ID, as
 /// `ucase_getCaseLocale` picks it: the language subtag, before the first `_`
 /// or `-`, in any letter case. A NULL or unknown locale maps case as the root
 /// locale does.
 fn case_language(locale: Option<&[u8]>) -> &'static LanguageIdentifier {
-    static ROOT: LanguageIdentifier = LanguageIdentifier::UNKNOWN;
     static TURKISH: LanguageIdentifier = langid!("tr");
     static LITHUANIAN: LanguageIdentifier = langid!("lt");
-    static GREEK: LanguageIdentifier = langid!("el");
     static DUTCH: LanguageIdentifier = langid!("nl");
     static ARMENIAN: LanguageIdentifier = langid!("hy");
     let Some(locale) = locale else {
@@ -797,6 +1017,21 @@ mod tests {
         assert_eq!(upper_in("և", text("hyw")), text("ԵՒ"));
         assert_eq!(upper_in("ά", text("el")), text("Α"));
         assert_eq!(case_map([Value::Null, text("tr")].iter(), Case::Upper), Value::Null);
+    }
+
+    #[test]
+    fn greek_uppercase_follows_icu() {
+        let upper_el = |value: &str| case_map([text(value), text("el")].iter(), Case::Upper);
+        assert_eq!(upper_el("ἲἳἴἵ"), text("ΙΪΙΪ"));
+        assert_eq!(upper_el("ὒὓὔὕ"), text("ΥΫΥΫ"));
+        assert_eq!(upper_el("άίίί"), text("ΑΪΙΪ"));
+        assert_eq!(upper_el("\u{3ac}\u{301}\u{3b9}\u{3b9}"), text("ΑΪΙ"));
+        assert_eq!(upper_el("\u{3ac}\u{3af}\u{3b9}"), text("ΑΪΙ"));
+        assert_eq!(upper_el("\u{3b1}\u{301}\u{3b9}\u{3b9}"), text("ΑΙ\u{308}Ι"));
+        assert_eq!(upper_el("\u{3b8}\u{308}"), text("Θ\u{308}"));
+        assert_eq!(upper_el("\u{3b1} \u{3ae}"), text("Α Ή"));
+        assert_eq!(upper_el("\u{1fb3}\u{301}\u{3b9}"), text("ΑΙΙ\u{308}"));
+        assert_eq!(upper_el("\u{3d3}\u{3b9}"), text("ϒΙ"));
     }
 
     #[test]

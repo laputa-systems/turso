@@ -7265,6 +7265,7 @@ dependencies = [
  "icu_casemap",
  "icu_collator",
  "icu_locale",
+ "icu_properties 2.2.0",
  "intrusive-collections",
  "io-uring",
  "libc",

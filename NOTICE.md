@@ -67,6 +67,11 @@ This project depends on tantivy-common, distributed by the Tantivy project autho
 * License: licenses/core/tantivy-common-mit-license.md (MIT License)
 * Homepage: https://github.com/quickwit-oss/tantivy
 
+This project depends on ICU4X (icu_casemap, icu_collator, icu_locale and icu_properties), distributed by the Unicode Consortium, and its Greek letter data is copied into core/functions/icu.rs:
+
+* License: licenses/core/icu4x-unicode-license.md (Unicode License V3)
+* Homepage: https://github.com/unicode-org/icu4x
+
 This project depends on windows-sys, distributed by the Microsoft:
 
 * License: licenses/core/windows-apache.license.md (Apache License v2.0)
