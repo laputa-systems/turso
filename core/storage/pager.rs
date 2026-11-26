@@ -5999,6 +5999,9 @@ impl Pager {
                             trunk_page.get().id() == trunk_page_id as usize,
                             "trunk page has unexpected id"
                         );
+                        if cfg!(feature = "secure_delete") {
+                            self.zero_freed_page(page)?;
+                        }
                         self.add_dirty(&trunk_page)?;
 
                         trunk_page_contents.write_u32_no_offset(
@@ -6022,7 +6025,11 @@ impl Pager {
                     turso_assert!(page.is_loaded(), "page should be loaded");
                     // If we get here, need to make this page a new trunk
                     turso_assert!(page.get().id() == page_id, "page has unexpected id");
-                    self.add_dirty(page)?;
+                    if cfg!(feature = "secure_delete") {
+                        self.zero_freed_page(page)?;
+                    } else {
+                        self.add_dirty(page)?;
+                    }
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
@@ -6042,6 +6049,15 @@ impl Pager {
         }
         *state = FreePageState::Start;
         Ok(IOResult::Done(()))
+    }
+
+    /// Overwrites a page that goes to the freelist with zeros, as SQLite's
+    /// `freePage2` does with SQLITE_SECURE_DELETE.
+    fn zero_freed_page(&self, page: &PageRef) -> Result<()> {
+        turso_assert!(page.is_loaded(), "freed page should be loaded");
+        self.add_dirty(page)?;
+        page.get_contents().as_ptr().fill(0);
+        Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

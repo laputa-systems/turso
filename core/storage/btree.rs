@@ -5512,6 +5512,11 @@ impl BTreeCursor {
             PageType::TableLeaf => PageType::TableInterior,
             other => other,
         } as u8;
+        if cfg!(feature = "secure_delete") {
+            // SQLite's balance_deeper empties the root with zeroPage, which
+            // overwrites it with zeros with SQLITE_SECURE_DELETE.
+            root_contents.as_ptr()[offset..self.usable_space()].fill(0);
+        }
         // set new page type
         root_contents.write_page_type(new_root_page_type);
         root_contents.write_rightmost_ptr(child.get().id() as u32);
@@ -9470,6 +9475,10 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
         contents.offset(),
         "offset doesn't match computed offset for page"
     );
+    if cfg!(feature = "secure_delete") {
+        // SQLite's zeroPage with SQLITE_SECURE_DELETE.
+        contents.as_ptr()[offset..usable_space].fill(0);
+    }
     let id = page_type as u8;
     contents.write_page_type(id);
     contents.write_first_freeblock(0);
@@ -9861,6 +9870,15 @@ fn page_insert_array(
 ///
 /// This function may merge the freed cell range into either the next freeblock,
 /// previous freeblock, or both.
+/// Overwrites freed space of a page with zeros, as SQLite's `freeSpace`
+/// does with SQLITE_SECURE_DELETE, after merging it with the free blocks
+/// around it.
+fn zero_freed_space(page: &PageContent, offset: usize, size: usize) {
+    if cfg!(feature = "secure_delete") {
+        page.as_ptr()[offset..offset + size].fill(0);
+    }
+}
+
 fn free_cell_range(
     page: &mut PageContent,
     mut offset: usize,
@@ -9886,6 +9904,7 @@ fn free_cell_range(
         if unlikely(offset < cur_content_area) {
             return_corrupt!("free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
         }
+        zero_freed_space(page, offset, size);
         if offset == cur_content_area {
             // if the freeblock list is empty and the freed range is exactly at the beginning of the content area,
             // we are not creating a freeblock; instead we are just extending the unallocated region.
@@ -9983,6 +10002,7 @@ fn free_cell_range(
     if unlikely(offset < cur_content_area) {
         return_corrupt!("free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
     }
+    zero_freed_space(page, offset, size);
 
     // As above, if the freed range is exactly at the beginning of the content area, we are not creating a freeblock;
     // instead we are just extending the unallocated region.
@@ -10190,6 +10210,18 @@ fn defragment_page_for_insert(
 
 /// Defragment a page. This means packing all the cells to the end of the page.
 fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isize) -> Result<()> {
+    pack_cells(page, usable_space, max_frag_bytes)?;
+    if cfg!(feature = "secure_delete") {
+        // SQLite's defragmentPage leaves zeros between the cell pointer
+        // array and the cells, where the moved cells were.
+        let start = page.unallocated_region_start();
+        page.as_ptr()[start..page.cell_content_area() as usize].fill(0);
+    }
+    Ok(())
+}
+
+/// Packs all the cells of a page to the end of the page.
+fn pack_cells(page: &PageContent, usable_space: usize, max_frag_bytes: isize) -> Result<()> {
     debug_validate_cells!(page, usable_space);
     tracing::debug!("defragment_page (optimized in-place)");
 
@@ -10927,9 +10959,6 @@ fn delete_may_need_balancing(
 #[inline]
 fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Result<()> {
     let (cell_start, cell_len) = page.cell_get_raw_region(cell_idx, usable_space)?;
-    if cfg!(feature = "secure_delete") {
-        page.as_ptr()[cell_start..cell_start + cell_len].fill(0);
-    }
     free_cell_range(page, cell_start, cell_len, usable_space)?;
     if page.cell_count() > 1 {
         shift_pointers_left(page, cell_idx);
