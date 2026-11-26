@@ -32,7 +32,7 @@ fn assert_text(val: &Value, expected: &str) {
     let Value::Text(t) = val else {
         panic!("expected Text, got: {val:?}");
     };
-    assert_eq!(t.value, expected);
+    assert_eq!(t.as_str(), expected);
 }
 
 fn assert_int(val: &Value, expected: i64) {

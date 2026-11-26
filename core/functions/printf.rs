@@ -916,7 +916,7 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
             'X' => format_hex(&mut result, arg, &spec, true),
             'o' => format_octal(&mut result, arg, &spec),
             'p' => format_hex(&mut result, arg, &spec, true),
-            's' | 'z' => match non_utf8_text(arg) {
+            's' | 'z' => match string_bytes(arg, &spec) {
                 Some(bytes) => format_non_utf8_string(&mut result, &mut spliced, bytes, &spec),
                 None => format_string(&mut result, arg, &spec),
             },
@@ -955,17 +955,27 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
 }
 
 /// The text of `value` as `sqlite3_value_text` reads it, up to its first NUL,
-/// when those bytes are not UTF-8.
-fn non_utf8_text(value: &Value) -> Option<&[u8]> {
+/// when the bytes that `%s` writes for it are not UTF-8: the text is not
+/// UTF-8, or a precision in bytes ends in the middle of a character.
+fn string_bytes<'a>(value: &'a Value, spec: &FormatSpec) -> Option<&'a [u8]> {
     let bytes = match value {
-        Value::Text(text) if !text.is_utf8() => text.as_bytes(),
+        Value::Text(text) => text.as_bytes(),
         Value::Blob(blob) => blob.as_slice(),
         _ => return None,
     };
     let bytes = &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())];
-    match str::from_utf8(bytes) {
-        Ok(_) => None,
-        Err(_) => Some(bytes),
+    let Ok(text) = str::from_utf8(bytes) else {
+        return Some(bytes);
+    };
+    match spec.precision {
+        Some(precision)
+            if !spec.flags.alt_form_2
+                && precision < text.len()
+                && !text.is_char_boundary(precision) =>
+        {
+            Some(bytes)
+        }
+        _ => None,
     }
 }
 

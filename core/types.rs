@@ -285,6 +285,13 @@ impl Text {
         }
     }
 
+    /// Whether the text has a buffer of its own, which a write into the text
+    /// can reuse.
+    #[cfg(feature = "json")]
+    pub(crate) fn has_own_buffer(&self) -> bool {
+        matches!(self.value, Cow::Owned(_))
+    }
+
     /// Takes the owned buffer of the text, which becomes empty. None for a
     /// text whose buffer is borrowed.
     pub(crate) fn take_buffer(&mut self) -> Option<std::vec::Vec<u8>> {
@@ -296,10 +303,14 @@ impl Text {
         Some(buffer)
     }
 
-    /// The buffer and the `split` of the text, for a copy of the text.
-    #[inline(always)]
-    fn parts(&self) -> (&[u8], u32) {
-        (&self.value, self.split)
+    /// The text, borrowed.
+    #[inline]
+    pub fn as_text_ref(&self) -> TextRef<'_> {
+        TextRef {
+            value: &self.value,
+            split: self.split,
+            subtype: self.subtype,
+        }
     }
 
     /// Sets `split` for the bytes in `value`, which hold no lossy rendition
@@ -354,12 +365,26 @@ impl Text {
 
     /// Replaces the text with a copy of `source`, in the same buffer when the
     /// buffer is large enough. An allocation failure leaves the text as it was.
-    fn try_copy_from(&mut self, source: &Text) -> std::result::Result<(), TryReserveError> {
-        let (bytes, split) = source.parts();
-        self.cleared_buffer(bytes.len())?.extend_from_slice(bytes);
-        self.split = split;
+    pub(crate) fn try_copy_from<T: AnyText>(
+        &mut self,
+        source: &T,
+    ) -> std::result::Result<(), TryReserveError> {
+        let source = source.as_text_ref();
+        self.cleared_buffer(source.value.len())?
+            .extend_from_slice(source.value);
+        self.split = source.split;
         self.subtype = source.subtype;
+        self.add_missing_rendition();
         Ok(())
+    }
+
+    /// Adds the lossy rendition after bytes that are not UTF-8 when the copy
+    /// of a [TextRef] read from a record has none.
+    #[inline(always)]
+    fn add_missing_rendition(&mut self) {
+        if self.split != UTF8_SPLIT && self.split as usize == self.value.len() {
+            self.add_lossy_rendition();
+        }
     }
 
     /// A copy of the text in a new buffer.
@@ -386,7 +411,7 @@ impl Text {
     }
 
     /// Adds `bytes` at the end of the text. The subtype becomes TEXT.
-    pub fn push_bytes(&mut self, bytes: &[u8]) {
+    pub(crate) fn push_bytes(&mut self, bytes: &[u8]) {
         self.try_push_bytes(bytes)
             .expect("memory for the bytes added to a TEXT");
     }
@@ -642,9 +667,7 @@ impl<'a> TextRef<'a> {
             split: self.split,
             subtype: self.subtype,
         };
-        if self.split != UTF8_SPLIT && self.split as usize == self.value.len() {
-            text.add_lossy_rendition();
-        }
+        text.add_missing_rendition();
         Ok(text)
     }
 }
@@ -771,9 +794,6 @@ impl Text {
             self.subtype = TextSubtype::Text;
         } else {
             self.do_extend(&TextRef::from_bytes(bytes, TextSubtype::Text))?;
-            if self.split != UTF8_SPLIT {
-                self.add_lossy_rendition();
-            }
         }
         return Ok(());
 
@@ -800,7 +820,8 @@ impl Text {
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) -> Result<()> {
-        let (other_bytes, split) = other.parts();
+        let other = other.as_text_ref();
+        let other_bytes = other.value;
         match &mut self.value {
             Cow::Owned(buffer) => {
                 let needed = other_bytes.len();
@@ -834,8 +855,9 @@ impl<T: AnyText> Extendable<T> for Text {
                 self.value = Cow::Owned(other_bytes.to_owned());
             }
         }
-        self.split = split;
-        self.subtype = other.subtype();
+        self.split = other.split;
+        self.subtype = other.subtype;
+        self.add_missing_rendition();
         Ok(())
     }
 }
@@ -871,15 +893,15 @@ impl<T: AnyBlob> Extendable<T> for ValueBlob {
 }
 
 pub trait AnyText {
-    /// The buffer and the `split` of the text, as [Text] stores them.
-    fn parts(&self) -> (&[u8], u32);
+    /// The text, borrowed.
+    fn as_text_ref(&self) -> TextRef<'_>;
     fn subtype(&self) -> TextSubtype;
 }
 
 impl AnyText for Text {
     #[inline(always)]
-    fn parts(&self) -> (&[u8], u32) {
-        Text::parts(self)
+    fn as_text_ref(&self) -> TextRef<'_> {
+        Text::as_text_ref(self)
     }
 
     fn subtype(&self) -> TextSubtype {
@@ -889,8 +911,8 @@ impl AnyText for Text {
 
 impl AnyText for TextRef<'_> {
     #[inline(always)]
-    fn parts(&self) -> (&[u8], u32) {
-        (self.value, self.split)
+    fn as_text_ref(&self) -> TextRef<'_> {
+        *self
     }
 
     fn subtype(&self) -> TextSubtype {
@@ -900,8 +922,8 @@ impl AnyText for TextRef<'_> {
 
 impl AnyText for &str {
     #[inline(always)]
-    fn parts(&self) -> (&[u8], u32) {
-        (self.as_bytes(), UTF8_SPLIT)
+    fn as_text_ref(&self) -> TextRef<'_> {
+        TextRef::new(self, TextSubtype::Text)
     }
 
     fn subtype(&self) -> TextSubtype {
@@ -1168,11 +1190,7 @@ impl Value {
         match self {
             Value::Null => ValueRef::Null,
             Value::Numeric(n) => ValueRef::Numeric(*n),
-            Value::Text(v) => ValueRef::Text(TextRef {
-                value: &v.value,
-                split: v.split,
-                subtype: v.subtype,
-            }),
+            Value::Text(v) => ValueRef::Text(v.as_text_ref()),
             Value::Blob(v) => ValueRef::Blob(v.as_slice()),
         }
     }

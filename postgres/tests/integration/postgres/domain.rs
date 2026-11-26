@@ -46,7 +46,7 @@ fn test_pg_create_domain_text_with_check(db: TempDatabase) {
     let Value::Text(v) = row.get_value(0) else {
         panic!("expected text");
     };
-    assert_eq!(v.value, "user@example.com");
+    assert_eq!(v.as_str(), "user@example.com");
     drop(rows);
 
     // Invalid
@@ -152,7 +152,7 @@ fn test_pg_create_domain_in_table(db: TempDatabase) {
     let Value::Text(name) = row.get_value(0) else {
         panic!("expected text");
     };
-    assert_eq!(name.value, "Bob");
+    assert_eq!(name.as_str(), "Bob");
     let Value::Numeric(Numeric::Integer(grade)) = row.get_value(1) else {
         panic!("expected integer");
     };
@@ -165,7 +165,7 @@ fn test_pg_create_domain_in_table(db: TempDatabase) {
     let Value::Text(name) = row.get_value(0) else {
         panic!("expected text");
     };
-    assert_eq!(name.value, "Alice");
+    assert_eq!(name.as_str(), "Alice");
     drop(rows);
 
     // Out of range should fail

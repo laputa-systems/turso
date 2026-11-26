@@ -401,18 +401,20 @@ fn index_key_compare_reports_corrupt_values() {
     let integer_record = ImmutableRecord::from_values(&[Value::from_i64(i64::MAX)], 1).unwrap();
     let integer = key(integer_record.get_payload());
 
-    for (lhs, rhs) in [
-        (&invalid_text, &text),
-        (&text, &invalid_text),
-        (&truncated_integer, &integer),
-        (&integer, &truncated_integer),
-    ] {
+    for (lhs, rhs) in [(&truncated_integer, &integer), (&integer, &truncated_integer)] {
         assert!(
             matches!(lhs.compare(rhs), Err(LimboError::Corrupt(_))),
             "{:?}",
             lhs.compare(rhs)
         );
     }
+    // As in SQLite, a TEXT that is not UTF-8 is not corrupt: BINARY
+    // compares its bytes.
+    assert_eq!(
+        invalid_text.compare(&text).unwrap(),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(text.compare(&invalid_text).unwrap(), std::cmp::Ordering::Less);
 }
 
 #[cfg(nightly)]

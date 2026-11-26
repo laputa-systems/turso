@@ -1347,7 +1347,7 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
             }
 
             let text = t.as_str();
-            let mut escaped_value = String::with_capacity(t.value.len() + 4);
+            let mut escaped_value = String::with_capacity(text.len() + 4);
             escaped_value.push('"');
             // Usually the text has no character to escape, and its JSON text
             // is the text in quotes.

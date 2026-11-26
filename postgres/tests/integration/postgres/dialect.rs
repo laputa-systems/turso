@@ -1059,7 +1059,7 @@ fn test_postgres_alter_table_rename(db: TempDatabase) {
     let Value::Text(val) = row.get_value(0) else {
         panic!("expected text");
     };
-    assert_eq!(val.value, "hello");
+    assert_eq!(val.as_str(), "hello");
 }
 
 #[turso_macros::test(mvcc)]
@@ -1096,7 +1096,7 @@ fn test_postgres_alter_table_add_column(db: TempDatabase) {
     let Value::Text(name) = row.get_value(1) else {
         panic!("expected text");
     };
-    assert_eq!(name.value, "alice");
+    assert_eq!(name.as_str(), "alice");
 }
 
 #[turso_macros::test(mvcc)]
@@ -1266,7 +1266,7 @@ fn test_postgres_alter_table_drop_column(db: TempDatabase) {
     let Value::Text(name) = row.get_value(1) else {
         panic!("expected text");
     };
-    assert_eq!(name.value, "alice");
+    assert_eq!(name.as_str(), "alice");
 }
 
 #[turso_macros::test]
@@ -1337,7 +1337,7 @@ fn test_postgres_alter_table_rename_column(db: TempDatabase) {
     let Value::Text(val) = row.get_value(0) else {
         panic!("expected text");
     };
-    assert_eq!(val.value, "hello");
+    assert_eq!(val.as_str(), "hello");
 }
 
 // ==================== CREATE INDEX / DROP INDEX ====================
@@ -1462,7 +1462,7 @@ fn test_postgres_cast_int_to_text(db: TempDatabase) {
     let Value::Text(val) = row.get_value(0) else {
         panic!("expected text, got {:?}", row.get_value(0));
     };
-    assert_eq!(val.value, "42");
+    assert_eq!(val.as_str(), "42");
 }
 
 #[turso_macros::test(mvcc)]
@@ -1492,7 +1492,7 @@ fn test_postgres_cast_float_to_text(db: TempDatabase) {
     let Value::Text(val) = row.get_value(0) else {
         panic!("expected text, got {:?}", row.get_value(0));
     };
-    assert_eq!(val.value, "3.14");
+    assert_eq!(val.as_str(), "3.14");
 }
 
 #[turso_macros::test(mvcc)]
@@ -3538,11 +3538,11 @@ fn test_postgres_default_now(db: TempDatabase) {
         );
     };
     // Should be a timestamp like "2024-01-15 14:30:45.123"
-    assert!(ts.value.len() >= 19, "timestamp too short: '{}'", ts.value);
+    assert!(ts.as_str().len() >= 19, "timestamp too short: '{}'", ts.as_str());
     assert!(
-        ts.value.contains('-') && ts.value.contains(':'),
+        ts.as_str().contains('-') && ts.as_str().contains(':'),
         "timestamp format wrong: '{}'",
-        ts.value
+        ts.as_str()
     );
 }
 
@@ -3592,7 +3592,7 @@ fn test_postgres_default_gen_random_uuid(db: TempDatabase) {
                 let Value::Text(t) = row.get_value(0) else {
                     panic!("expected text value for token");
                 };
-                uuids.push(t.value.to_string());
+                uuids.push(t.as_str().to_string());
             }
             StepResult::Done => break,
             _ => {}
@@ -3635,7 +3635,7 @@ fn test_postgres_default_clock_timestamp(db: TempDatabase) {
     let Value::Text(ts) = row.get_value(0) else {
         panic!("expected text value for ts");
     };
-    assert!(ts.value.len() >= 19, "timestamp too short: '{}'", ts.value);
+    assert!(ts.as_str().len() >= 19, "timestamp too short: '{}'", ts.as_str());
 }
 
 /// Tests DEFAULT transaction_timestamp() and statement_timestamp() work.
@@ -3667,8 +3667,8 @@ fn test_postgres_default_transaction_and_statement_timestamp(db: TempDatabase) {
         panic!("expected text for stmt_ts");
     };
     // Both should be valid timestamps
-    assert!(txn_ts.value.len() >= 19);
-    assert!(stmt_ts.value.len() >= 19);
+    assert!(txn_ts.as_str().len() >= 19);
+    assert!(stmt_ts.as_str().len() >= 19);
 }
 
 /// Tests that now() and gen_random_uuid() also work in SELECT (not just DEFAULT).
@@ -3686,9 +3686,9 @@ fn test_postgres_select_now_and_uuid(db: TempDatabase) {
         panic!("expected text from now()");
     };
     assert!(
-        ts.value.len() >= 19,
+        ts.as_str().len() >= 19,
         "now() result too short: '{}'",
-        ts.value
+        ts.as_str()
     );
     drop(stmt);
 
@@ -3702,10 +3702,10 @@ fn test_postgres_select_now_and_uuid(db: TempDatabase) {
         panic!("expected text from gen_random_uuid()");
     };
     assert_eq!(
-        uuid.value.split('-').count(),
+        uuid.as_str().split('-').count(),
         5,
         "UUID format wrong: '{}'",
-        uuid.value
+        uuid.as_str()
     );
 }
 
@@ -3737,19 +3737,19 @@ fn test_postgres_default_multiple_functions(db: TempDatabase) {
     let Value::Text(uuid) = row.get_value(0) else {
         panic!("expected text for uuid");
     };
-    assert_eq!(uuid.value.split('-').count(), 5);
+    assert_eq!(uuid.as_str().split('-').count(), 5);
 
     // created should be a timestamp
     let Value::Text(created) = row.get_value(1) else {
         panic!("expected text for created");
     };
-    assert!(created.value.len() >= 19);
+    assert!(created.as_str().len() >= 19);
 
     // status should be the literal default
     let Value::Text(status) = row.get_value(2) else {
         panic!("expected text for status");
     };
-    assert_eq!(status.value, "active");
+    assert_eq!(status.as_str(), "active");
 }
 
 /// Tests DEFAULT with type cast syntax (e.g. '{}'::jsonb).
@@ -3780,7 +3780,7 @@ fn test_postgres_default_casted_expression(db: TempDatabase) {
         panic!("expected text for data, got {:?}", row.get_value(0));
     };
     assert_eq!(
-        data.value, "{}",
+        data.as_str(), "{}",
         "casted default '{{}}'::jsonb should produce '{{}}'"
     );
 
@@ -3788,14 +3788,14 @@ fn test_postgres_default_casted_expression(db: TempDatabase) {
         panic!("expected text for tags, got {:?}", row.get_value(1));
     };
     assert_eq!(
-        tags.value, "[]",
+        tags.as_str(), "[]",
         "casted default '[]'::jsonb should produce '[]'"
     );
 
     let Value::Text(name) = row.get_value(2) else {
         panic!("expected text for name, got {:?}", row.get_value(2));
     };
-    assert_eq!(name.value, "unnamed");
+    assert_eq!(name.as_str(), "unnamed");
 }
 
 #[turso_macros::test(mvcc)]

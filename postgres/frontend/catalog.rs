@@ -5559,7 +5559,7 @@ mod tests {
                 StepResult::Row => {
                     let row = stmt.row().unwrap();
                     if let Value::Text(nspname) = row.get_value(1) {
-                        match nspname.value.as_ref() {
+                        match nspname.as_str() {
                             "pg_catalog" => found_pg_catalog = true,
                             "public" => found_public = true,
                             "information_schema" => found_information_schema = true,
@@ -5696,9 +5696,9 @@ mod tests {
             };
 
             assert!(oid >= 16384, "OID should be >= 16384 for user tables");
-            assert_eq!(relname.value, "test_table", "Table name should match");
+            assert_eq!(relname.as_str(), "test_table", "Table name should match");
             assert_eq!(
-                relkind.value, "r",
+                relkind.as_str(), "r",
                 "relkind should be 'r' for regular table"
             );
             assert_eq!(relnatts, 3, "Table should have 3 columns");
@@ -5817,7 +5817,7 @@ mod tests {
             match stmt.step().unwrap() {
                 StepResult::Row => {
                     if let Value::Text(name) = stmt.row().unwrap().get_value(0) {
-                        if name.value == "__turso_ns1_users" {
+                        if name.as_str() == "__turso_ns1_users" {
                             found = true;
                         }
                     }
@@ -5841,7 +5841,7 @@ mod tests {
             match stmt.step().unwrap() {
                 StepResult::Row => {
                     if let Value::Text(name) = stmt.row().unwrap().get_value(0) {
-                        if name.value == "users" {
+                        if name.as_str() == "users" {
                             found = true;
                         }
                     }

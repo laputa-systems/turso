@@ -37,7 +37,7 @@ fn test_postgres_read_real_table(db: TempDatabase) {
     let Value::Text(name) = row.get_value(1) else {
         panic!("expected text for name");
     };
-    assert_eq!(name.value, "Alice");
+    assert_eq!(name.as_str(), "Alice");
 
     let Value::Numeric(Numeric::Integer(age)) = row.get_value(2) else {
         panic!("expected integer for age");
@@ -58,7 +58,7 @@ fn test_postgres_read_real_table(db: TempDatabase) {
     let Value::Text(name) = row.get_value(1) else {
         panic!("expected text for name");
     };
-    assert_eq!(name.value, "Bob");
+    assert_eq!(name.as_str(), "Bob");
 
     // No more rows
     let StepResult::Done = rows.step().unwrap() else {
@@ -95,7 +95,7 @@ fn test_postgres_select_columns(db: TempDatabase) {
     let Value::Text(name) = row.get_value(1) else {
         panic!("expected text for name");
     };
-    assert_eq!(name.value, "Alice");
+    assert_eq!(name.as_str(), "Alice");
 }
 
 #[turso_macros::test(mvcc)]
@@ -127,7 +127,7 @@ fn test_postgres_where_clause(db: TempDatabase) {
     let Value::Text(name) = row.get_value(0) else {
         panic!("expected text for name");
     };
-    assert_eq!(name.value, "Alice");
+    assert_eq!(name.as_str(), "Alice");
 
     // Should be only one row
     let StepResult::Done = rows.step().unwrap() else {
@@ -163,7 +163,7 @@ fn test_postgres_create_table_as(db: TempDatabase) {
     let Value::Text(name) = row.get_value(1) else {
         panic!("expected text for name");
     };
-    assert_eq!(name.value, "Alice");
+    assert_eq!(name.as_str(), "Alice");
 
     let StepResult::Row = rows.step().unwrap() else {
         panic!("expected row");
@@ -225,7 +225,7 @@ fn test_postgres_select_into(db: TempDatabase) {
     let Value::Text(name) = row.get_value(0) else {
         panic!("expected text for name");
     };
-    assert_eq!(name.value, "Bob");
+    assert_eq!(name.as_str(), "Bob");
     let StepResult::Done = rows.step().unwrap() else {
         panic!("expected done");
     };
@@ -565,7 +565,7 @@ fn key_rows(conn: &turso_pg::Connection, table: &str) -> Vec<(Option<i64>, Strin
         let Value::Text(v) = row.get_value(1) else {
             panic!("expected text for v");
         };
-        result.push((id, v.value.to_string()));
+        result.push((id, v.as_str().to_string()));
     }
     result
 }

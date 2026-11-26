@@ -1,9 +1,8 @@
-use std::borrow::Cow;
 use std::cell::{Cell, RefCell, UnsafeCell};
 
 use crate::alloc::{TryClone, TryReserveError};
 use crate::sync::Arc;
-use crate::types::{AsValueRef, Text};
+use crate::types::AsValueRef;
 use crate::{Value, ValueRef};
 
 use super::json_path_from_text;
@@ -149,9 +148,7 @@ impl JsonCache {
 #[inline]
 fn key_matches(key: ValueRef, stored: &Value) -> bool {
     match (key, stored) {
-        (ValueRef::Text(key), Value::Text(stored)) => {
-            key.value.as_bytes() == stored.value.as_bytes()
-        }
+        (ValueRef::Text(key), Value::Text(stored)) => key.as_bytes() == stored.as_bytes(),
         (ValueRef::Blob(key), Value::Blob(stored)) => key == stored.as_slice(),
         _ => key.value_type() == stored.value_type() && key == *stored,
     }
@@ -161,18 +158,7 @@ fn key_matches(key: ValueRef, stored: &Value) -> bool {
 /// buffer of `stored` when `stored` has the same type.
 fn copy_key(stored: &mut Value, key: ValueRef) -> std::result::Result<(), TryReserveError> {
     match (&mut *stored, key) {
-        (
-            Value::Text(Text {
-                value: Cow::Owned(stored_text),
-                subtype,
-            }),
-            ValueRef::Text(text),
-        ) => {
-            stored_text.try_reserve(text.value.len().saturating_sub(stored_text.len()))?;
-            stored_text.clear();
-            stored_text.push_str(text.value);
-            *subtype = text.subtype;
-        }
+        (Value::Text(stored_text), ValueRef::Text(text)) => stored_text.try_copy_from(&text)?,
         (Value::Blob(stored_blob), ValueRef::Blob(blob)) => {
             stored_blob.try_reserve(blob.len().saturating_sub(stored_blob.len()))?;
             stored_blob.clear();
@@ -395,6 +381,7 @@ impl JsonCacheCell {
 mod tests {
     use super::*;
     use crate::json::{curry_convert_dbtype_into_jsonb, Conv};
+    use std::borrow::Cow;
     use std::str::FromStr;
 
     // Helper function to create test Value and Jsonb from JSON string

@@ -17,7 +17,7 @@ use crate::{
         vtab::columns::{Columns, Key},
         Conv, InBlob, JsonCacheCell,
     },
-    types::{AsValueRef, Text, TextSubtype},
+    types::{AsValueRef, Text},
     vtab::{column_definition, InternalVirtualTable, InternalVirtualTableCursor},
     Connection, LimboError, Value, ValueRef,
 };
@@ -445,13 +445,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
     /// columns are the values of [Self::column].
     fn column_into(&self, idx: usize, value: &mut Value) -> Result<(), LimboError> {
         // Only a text with a buffer of its own has a buffer to write into.
-        if !matches!(
-            value,
-            Value::Text(Text {
-                value: Cow::Owned(_),
-                ..
-            })
-        ) {
+        if !matches!(value, Value::Text(text) if text.has_own_buffer()) {
             *value = self.column(idx)?;
             return Ok(());
         }
@@ -476,15 +470,8 @@ impl InternalVirtualTableCursor for JsonEachCursor {
 /// Makes `value` the text `text`, in the buffer of `value` when `value` is a
 /// text with a buffer of its own.
 fn set_text(value: &mut Value, text: &str) -> Result<(), LimboError> {
-    if let Value::Text(Text {
-        value: Cow::Owned(buffer),
-        subtype,
-    }) = value
-    {
-        buffer.clear();
-        buffer.try_reserve(text.len())?;
-        buffer.push_str(text);
-        *subtype = TextSubtype::Text;
+    if let Value::Text(stored) = value {
+        stored.try_copy_from(&text)?;
         return Ok(());
     }
     *value = Value::Text(Text::new(text.to_owned()));
@@ -1124,10 +1111,7 @@ mod tests {
     /// The buffer of a text value, or None for other values.
     fn text_buffer(value: &Value) -> Option<*const u8> {
         match value {
-            Value::Text(Text {
-                value: Cow::Owned(text),
-                ..
-            }) => Some(text.as_ptr()),
+            Value::Text(text) if text.has_own_buffer() => Some(text.as_bytes().as_ptr()),
             _ => None,
         }
     }

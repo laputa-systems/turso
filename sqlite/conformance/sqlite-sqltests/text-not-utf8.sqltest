@@ -1,0 +1,56 @@
+@database :memory:
+
+# SQLite does not check that TEXT is UTF-8. A TEXT keeps the bytes it was
+# given, and the text functions work on these bytes.
+
+test cast-of-blob-to-text-keeps-the-bytes {
+    SELECT hex(CAST(x'fffe' AS TEXT)), typeof(CAST(x'fffe' AS TEXT)), length(CAST(x'fffe' AS TEXT)), octet_length(CAST(x'fffe' AS TEXT));
+}
+expect {
+    FFFE|text|2|2
+}
+
+test concatenation-keeps-the-bytes {
+    SELECT hex(x'fffe' || 'a'), typeof(x'ff' || x'fe'), hex(x'ff' || x'fe'), hex(concat(x'ff', 'a', CAST(x'fe' AS TEXT)));
+}
+expect {
+    FFFE61|text|FFFE|FF61FE
+}
+
+test text-functions-read-the-bytes {
+    SELECT length(CAST(x'61ff80c3a962' AS TEXT)), hex(substr(CAST(x'61ff80c3a962' AS TEXT), 2, 2)), instr(CAST(x'61ff80c3a962' AS TEXT), 'b'), hex(replace(CAST(x'61ff62' AS TEXT), CAST(x'ff' AS TEXT), 'x')), hex(trim(CAST(x'ff61ff' AS TEXT), CAST(x'ff' AS TEXT))), hex(quote(CAST(x'27ff' AS TEXT)));
+}
+expect {
+    4|FF80C3A9|4|617862|61|272727FF27
+}
+
+test comparisons-compare-the-bytes {
+    SELECT CAST(x'ff' AS TEXT) > 'z', CAST(x'ff' AS TEXT) = CAST(x'ff' AS TEXT), CAST(x'ff' AS TEXT) = CAST(x'fe' AS TEXT), CAST(x'ff41' AS TEXT) = CAST(x'ff61' AS TEXT) COLLATE NOCASE;
+}
+expect {
+    1|1|0|1
+}
+
+test printf-writes-the-bytes {
+    SELECT hex(printf('%s|%.1s|%3s', CAST(x'ff61' AS TEXT), CAST(x'c3a9' AS TEXT), CAST(x'fe' AS TEXT)));
+}
+expect {
+    FF617CC37C2020FE
+}
+
+@cross-check-integrity
+test indexed-text-keeps-the-bytes {
+    CREATE TABLE t(a TEXT);
+    CREATE INDEX ta ON t(a);
+    INSERT INTO t VALUES (CAST(x'ff' AS TEXT)), (CAST(x'fe' AS TEXT)), ('a'), (CAST(x'ff' AS TEXT));
+    SELECT hex(a), count(*) FROM t GROUP BY a ORDER BY a;
+    SELECT count(*) FROM t WHERE a = CAST(x'ff' AS TEXT);
+    SELECT hex(group_concat(a, '|')) FROM (SELECT a FROM t ORDER BY a);
+}
+expect {
+    61|1
+    FE|1
+    FF|2
+    2
+    617CFE7CFF7CFF
+}
