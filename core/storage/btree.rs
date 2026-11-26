@@ -10927,6 +10927,9 @@ fn delete_may_need_balancing(
 #[inline]
 fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Result<()> {
     let (cell_start, cell_len) = page.cell_get_raw_region(cell_idx, usable_space)?;
+    if cfg!(feature = "secure_delete") {
+        page.as_ptr()[cell_start..cell_start + cell_len].fill(0);
+    }
     free_cell_range(page, cell_start, cell_len, usable_space)?;
     if page.cell_count() > 1 {
         shift_pointers_left(page, cell_idx);
