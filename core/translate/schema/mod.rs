@@ -1485,6 +1485,7 @@ pub fn translate_create_table(
             )?;
         }
     }
+    resolver.with_schema(database_id, |schema| table.resolve_custom_types(schema))?;
     let index_regs = collect_autoindexes(&table, program)?;
 
     // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other
@@ -3237,6 +3238,7 @@ pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Resu
         stored_form_sorts_in_value_order: _,
         is_type_of_conditions: _,
         casts_to_numbers_and_booleans: _,
+        can_be_rowid_alias: _,
         sql: _,
         domain_checks,
         kind,
