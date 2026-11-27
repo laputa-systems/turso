@@ -1,0 +1,23 @@
+@database :memory:
+
+@cross-check-integrity
+test rename-column-with-broken-view {
+    CREATE TABLE t(a);
+    CREATE TABLE s(k TEXT PRIMARY KEY, v BLOB) WITHOUT ROWID;
+    ALTER TABLE t RENAME TO t2;
+    CREATE VIEW vw AS SELECT a FROM t;
+    ALTER TABLE s RENAME COLUMN v TO w;
+}
+expect error {
+    error in view vw: no such table: (main\.)?t
+}
+
+test rename-column-with-valid-view {
+    CREATE TABLE s(k TEXT PRIMARY KEY, v BLOB) WITHOUT ROWID;
+    CREATE VIEW vw AS SELECT k FROM s;
+    ALTER TABLE s RENAME COLUMN v TO w;
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+}
+expect {
+    CREATE TABLE s(k TEXT PRIMARY KEY, w BLOB) WITHOUT ROWID
+}

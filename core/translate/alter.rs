@@ -1766,6 +1766,32 @@ pub fn translate_alter_table(
             let mut triggers_to_rewrite: Vec<(NamespaceRef, String, String)> = Vec::new();
             let mut views_to_rewrite: Vec<RewrittenView> = Vec::new();
             if rename {
+                for (view_name, view) in resolver.with_schema(database_id, |s| {
+                    s.views(namespace.id)
+                        .map(|(name, view)| (name.to_string(), view.clone()))
+                        .collect::<Vec<_>>()
+                }) {
+                    validate_view_table_refs_after_rename(
+                        &view,
+                        &view_name,
+                        resolver,
+                        database_id,
+                    )?;
+                }
+                if database_id != crate::TEMP_DB_ID {
+                    for (view_name, view) in resolver.with_schema(crate::TEMP_DB_ID, |s| {
+                        s.views(NamespaceId::ROOT)
+                            .map(|(name, view)| (name.to_string(), view.clone()))
+                            .collect::<Vec<_>>()
+                    }) {
+                        validate_view_table_refs_after_rename(
+                            &view,
+                            &view_name,
+                            resolver,
+                            crate::TEMP_DB_ID,
+                        )?;
+                    }
+                }
                 // Try to rewrite every trigger's SQL for the column rename.
                 // If the rewritten SQL differs from the original, include it
                 // in the update list. This matches SQLite's approach and avoids
@@ -4633,6 +4659,28 @@ impl crate::util::AstVisitor for RenameTableRefCheck<'_> {
     fn report_target_tables(&self) -> bool {
         true
     }
+}
+
+fn validate_view_table_refs_after_rename(
+    view: &crate::schema::View,
+    view_name: &str,
+    resolver: &Resolver,
+    view_database_id: usize,
+) -> Result<()> {
+    let mut check = RenameTableRefCheck {
+        altered_table_norm: "",
+        resolver,
+        trigger_database_id: view_database_id,
+        altered_database_id: view_database_id,
+        missing: None,
+    };
+    crate::util::visit_select(&view.select_stmt, &mut check)?;
+    if let Some(missing) = check.missing {
+        return Err(LimboError::ParseError(format!(
+            "error in view {view_name}: no such table: {missing}"
+        )));
+    }
+    Ok(())
 }
 
 fn table_reference_exists_after_rename(
